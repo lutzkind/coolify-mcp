@@ -14,6 +14,8 @@ import {
   getApplicationActions,
   getDeploymentActions,
   getPagination,
+  summarizeDeploymentForRead,
+  filterLogText,
 } from '../lib/mcp-server.js';
 
 describe('CoolifyMcpServer v2', () => {
@@ -1531,6 +1533,114 @@ describe('getDeploymentActions', () => {
   it('should return empty actions when no appUuid and not in_progress', () => {
     const actions = getDeploymentActions('dep-uuid', 'finished', undefined);
     expect(actions).toEqual([]);
+  });
+});
+
+describe('summarizeDeploymentForRead', () => {
+  it('should keep safe deployment essentials and omit nested sensitive metadata', () => {
+    const raw = {
+      id: 606,
+      uuid: 'internal-row-606',
+      deployment_uuid: 'deploy-uuid-123',
+      application_uuid: 'app-uuid-123',
+      application_name: 'osm-country-scraper',
+      status: 'finished',
+      commit: 'abc123',
+      server_name: 'localhost',
+      force_rebuild: false,
+      is_webhook: false,
+      is_api: true,
+      created_at: '2026-06-18T06:23:45.000000Z',
+      updated_at: '2026-06-18T06:24:54.000000Z',
+      application: {
+        uuid: 'app-uuid-123',
+        name: 'osm-country-scraper',
+        status: 'running:healthy',
+        custom_labels: 'ZXZpbA==',
+      },
+      server: {
+        name: 'localhost',
+        settings: {
+          sentinel_token: 'secret-sentinel-token',
+        },
+      },
+    };
+
+    const result = summarizeDeploymentForRead(raw);
+
+    expect(result).toEqual({
+      deployment_uuid: 'deploy-uuid-123',
+      deployment_id: 606,
+      application_uuid: 'app-uuid-123',
+      application_name: 'osm-country-scraper',
+      application_status: 'running:healthy',
+      health_result: 'running:healthy',
+      server_name: 'localhost',
+      status: 'finished',
+      commit_sha: 'abc123',
+      force_rebuild: false,
+      restart_only: undefined,
+      is_webhook: false,
+      is_api: true,
+      created_at: '2026-06-18T06:23:45.000000Z',
+      updated_at: '2026-06-18T06:24:54.000000Z',
+      finished_at: null,
+      logs: undefined,
+      logs_meta: undefined,
+      logs_redacted: undefined,
+      secrets_redacted: true,
+    });
+
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain('custom_labels');
+    expect(serialized).not.toContain('sentinel_token');
+    expect(serialized).not.toContain('secret-sentinel-token');
+  });
+
+  it('should preserve redacted logs metadata without leaking secret-bearing fields', () => {
+    const raw = {
+      deployment_uuid: 'deploy-uuid-123',
+      application_name: 'osm-country-scraper',
+      status: 'finished',
+      commit: 'abc123',
+      application: {
+        uuid: 'app-uuid-123',
+        status: 'running:healthy',
+      },
+      custom_labels: 'ZXZpbA==',
+    };
+
+    const result = summarizeDeploymentForRead(raw, {
+      logs: 'Bearer ***REDACTED***',
+      logs_meta: { total_entries: 20, showing: '1-20 of 20', chars: 21 },
+    });
+
+    expect(result.logs).toBe('Bearer ***REDACTED***');
+    expect(result.logs_meta).toEqual({
+      total_entries: 20,
+      showing: '1-20 of 20',
+      chars: 21,
+    });
+    expect(result.logs_redacted).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('custom_labels');
+  });
+});
+
+describe('filterLogText', () => {
+  it('filters logs, removes ANSI, applies context, and redacts secrets', () => {
+    const result = filterLogText(
+      '\u001b[31mINFO start\u001b[0m\nWARNING Authorization: Bearer secret-value-long\nERROR failed\nINFO done',
+      {
+        search: 'error',
+        context_before: 1,
+        max_chars: 200,
+      },
+    );
+    expect(result.matched_lines).toBe(1);
+    expect(result.logs).toContain('WARNING');
+    expect(result.logs).toContain('ERROR failed');
+    expect(result.logs).not.toContain('\u001b');
+    expect(result.logs).not.toContain('secret-value');
   });
 });
 

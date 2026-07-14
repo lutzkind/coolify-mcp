@@ -9,6 +9,9 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
 import {
   CoolifyClient,
+  composeHash,
+  decodeCompose,
+  redactSensitiveText,
   type ServerSummary,
   type ProjectSummary,
   type ApplicationSummary,
@@ -16,16 +19,14 @@ import {
   type ServiceSummary,
   type GitHubAppSummary,
 } from './coolify-client.js';
+import { parseDocument } from 'yaml';
 import type {
   CoolifyConfig,
   GitHubApp,
   BuildPack,
   ResponseAction,
   ResponsePagination,
-  ScheduledTaskExecution,
   Deployment,
-  DeploymentEssential,
-  DeployTriggerResponse,
 } from '../types/coolify.js';
 import { DocsSearchEngine } from './docs-search.js';
 
@@ -50,6 +51,43 @@ function wrap<T>(
     }));
 }
 
+function redactCompose(compose: string): string {
+  return compose
+    .split('\n')
+    .map((line) => {
+      // Keep variable names and interpolation references, never their values.
+      if (/^\s*-[^:]*:\s*/.test(line) || /^\s*[A-Za-z_][A-Za-z0-9_.-]*:\s*/.test(line)) {
+        const match = line.match(/^(\s*(?:-\s*)?[A-Za-z_][A-Za-z0-9_.-]*:\s*)(.*)$/);
+        if (match && /(password|secret|token|key|credential|auth|environment)/i.test(match[1])) {
+          return `${match[1]}***REDACTED***`;
+        }
+      }
+      if (/^\s*-\s*[A-Za-z_][A-Za-z0-9_]*=/.test(line)) {
+        return line.replace(/(=).*/, '$1***REDACTED***');
+      }
+      return redactSensitiveText(line);
+    })
+    .join('\n');
+}
+
+function validateCompose(compose: string): void {
+  const document = parseDocument(compose);
+  if (document.errors.length)
+    throw new Error(`Invalid Docker Compose YAML: ${document.errors[0].message}`);
+}
+
+function redactedComposeDiff(
+  before: string,
+  after: string,
+): { added: string[]; removed: string[] } {
+  const oldLines = new Set(redactCompose(before).split('\n'));
+  const newLines = new Set(redactCompose(after).split('\n'));
+  return {
+    added: [...newLines].filter((line) => !oldLines.has(line)),
+    removed: [...oldLines].filter((line) => !newLines.has(line)),
+  };
+}
+
 const TRUNCATION_PREFIX = '...[truncated]...\n';
 
 interface LogEntry {
@@ -65,6 +103,343 @@ export interface TruncatedLogsResult {
   total: number;
   showing_start: number;
   showing_end: number;
+}
+
+interface ApplicationMutationPreflight {
+  uuid: string;
+  name?: string;
+  requested_action: 'deploy' | 'start' | 'stop' | 'restart';
+  effective_action: 'deploy' | 'start' | 'stop' | 'restart';
+  status: 'ready' | 'noop' | 'blocked';
+  reason?: string;
+  current_status?: string;
+  active_deployments: number;
+}
+
+interface SafeDeploymentRead {
+  deployment_uuid: string | null;
+  deployment_id?: number;
+  application_uuid: string | null;
+  application_name: string | null;
+  application_status: string | null;
+  health_result: string | null;
+  server_name: string | null;
+  status: string | null;
+  commit_sha: string | null;
+  force_rebuild?: boolean;
+  restart_only?: boolean;
+  is_webhook?: boolean;
+  is_api?: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  finished_at: string | null;
+  logs?: string;
+  logs_meta?: {
+    total_entries?: number;
+    showing?: string;
+    chars?: number;
+  };
+  logs_redacted?: boolean;
+  secrets_redacted: true;
+  identifiers?: Record<string, string>;
+}
+
+function summarizeApplicationForRead(app: Record<string, any>): Record<string, unknown> {
+  return {
+    uuid: app.uuid,
+    name: app.name,
+    description: app.description,
+    status: app.status,
+    server_status: app.server_status,
+    fqdn: app.fqdn,
+    git_repository: app.git_repository,
+    git_branch: app.git_branch,
+    git_commit_sha: app.git_commit_sha,
+    build_pack: app.build_pack,
+    base_directory: app.base_directory,
+    publish_directory: app.publish_directory,
+    ports_exposes: app.ports_exposes,
+    redirect: app.redirect,
+    health_check: {
+      enabled: app.health_check_enabled,
+      path: app.health_check_path,
+      port: app.health_check_port,
+      method: app.health_check_method,
+      return_code: app.health_check_return_code,
+      scheme: app.health_check_scheme,
+      interval: app.health_check_interval,
+      timeout: app.health_check_timeout,
+      retries: app.health_check_retries,
+      start_period: app.health_check_start_period,
+    },
+    source: {
+      type: app.source_type,
+      id: app.source_id,
+    },
+    destination: app.destination
+      ? {
+          id: app.destination.id,
+          uuid: app.destination.uuid,
+          name: app.destination.name,
+          type: app.destination_type,
+          server: app.destination.server
+            ? {
+                uuid: app.destination.server.uuid,
+                name: app.destination.server.name,
+                ip: app.destination.server.ip,
+              }
+            : undefined,
+        }
+      : undefined,
+    last_online_at: app.last_online_at,
+    last_restart_at: app.last_restart_at,
+    last_restart_type: app.last_restart_type,
+    restart_count: app.restart_count,
+    created_at: app.created_at,
+    updated_at: app.updated_at,
+    secrets_redacted: true,
+    identifiers: {
+      ...(app.uuid ? { coolify_application_uuid: String(app.uuid) } : {}),
+      ...(app.correlation_id ? { correlation_id: String(app.correlation_id) } : {}),
+    },
+  };
+}
+
+function readString(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+function readBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function readNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+export function summarizeDeploymentForRead(
+  deployment: Record<string, any>,
+  options?: {
+    logs?: string;
+    logs_meta?: { total_entries?: number; showing?: string; chars?: number };
+  },
+): SafeDeploymentRead {
+  const application = deployment.application as Record<string, any> | undefined;
+  const applicationUuid =
+    readString(deployment.application_uuid) ?? readString(application?.uuid) ?? null;
+  const applicationName =
+    readString(deployment.application_name) ?? readString(application?.name) ?? null;
+  const applicationStatus =
+    readString(deployment.application_status) ?? readString(application?.status) ?? null;
+
+  return {
+    deployment_uuid: readString(deployment.deployment_uuid) ?? readString(deployment.uuid) ?? null,
+    deployment_id: readNumber(deployment.id),
+    application_uuid: applicationUuid,
+    application_name: applicationName,
+    application_status: applicationStatus,
+    health_result: applicationStatus,
+    server_name:
+      readString(deployment.server_name) ??
+      readString((deployment.server as Record<string, any> | undefined)?.name) ??
+      null,
+    status: readString(deployment.status),
+    commit_sha: readString(deployment.commit),
+    force_rebuild: readBoolean(deployment.force_rebuild),
+    restart_only: readBoolean(deployment.restart_only),
+    is_webhook: readBoolean(deployment.is_webhook),
+    is_api: readBoolean(deployment.is_api),
+    created_at: readString(deployment.created_at),
+    updated_at: readString(deployment.updated_at),
+    finished_at: readString(deployment.finished_at),
+    logs: options?.logs,
+    logs_meta: options?.logs_meta,
+    logs_redacted: options?.logs ? true : undefined,
+    secrets_redacted: true,
+  };
+}
+
+function deploymentIdentifiers(deployment: Record<string, any>): Record<string, string> {
+  const app = deployment.application as Record<string, any> | undefined;
+  return Object.fromEntries(
+    [
+      ['coolify_application_uuid', deployment.application_uuid ?? app?.uuid],
+      ['coolify_deployment_uuid', deployment.deployment_uuid ?? deployment.uuid],
+      ['correlation_id', deployment.correlation_id],
+    ]
+      .filter(([, value]) => value !== undefined && value !== null && value !== '')
+      .map(([key, value]) => [key, String(value)]),
+  );
+}
+
+export function filterLogText(
+  raw: string,
+  options: {
+    search?: string;
+    search_regex?: boolean;
+    case_sensitive?: boolean;
+    context_before?: number;
+    context_after?: number;
+    exception_only?: boolean;
+    warning_only?: boolean;
+    remove_ansi?: boolean;
+    from?: string;
+    to?: string;
+    max_chars?: number;
+  } = {},
+): { logs: string; matched_lines: number; truncated: boolean; total_lines: number } {
+  // eslint-disable-next-line no-control-regex
+  const ansi =
+    /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
+  const source = options.remove_ansi === false ? String(raw) : String(raw).replace(ansi, '');
+  const lines = source.split('\n');
+  const matches = (line: string) => {
+    if (options.search) {
+      if (options.search_regex) {
+        let re: RegExp;
+        try {
+          re = new RegExp(options.search, options.case_sensitive ? '' : 'i');
+        } catch (error) {
+          throw new Error(`invalid log search regex: ${(error as Error).message}`, {
+            cause: error,
+          });
+        }
+        if (!re.test(line)) return false;
+      } else if (
+        (options.case_sensitive ? line : line.toLowerCase()).includes(
+          options.case_sensitive ? options.search : options.search.toLowerCase(),
+        ) === false
+      )
+        return false;
+    }
+    if (options.exception_only && !/(exception|traceback|error|fatal|panic|failed)/i.test(line))
+      return false;
+    if (options.warning_only && !/(warn|warning)/i.test(line)) return false;
+    const stamp = line.match(/\b\d{4}-\d\d-\d\dT[^\s\]]+/)?.[0];
+    if (stamp && options.from && Date.parse(stamp) < Date.parse(options.from)) return false;
+    if (stamp && options.to && Date.parse(stamp) > Date.parse(options.to)) return false;
+    return true;
+  };
+  const matching = lines.map((line, i) => (matches(line) ? i : -1)).filter((i) => i >= 0);
+  const selected = new Set<number>();
+  if (
+    options.search ||
+    options.exception_only ||
+    options.warning_only ||
+    options.from ||
+    options.to
+  ) {
+    const before = Math.min(Math.max(options.context_before ?? 0, 0), 20);
+    const after = Math.min(Math.max(options.context_after ?? 0, 0), 20);
+    for (const i of matching)
+      for (let j = Math.max(0, i - before); j <= Math.min(lines.length - 1, i + after); j += 1)
+        selected.add(j);
+  } else lines.forEach((_, i) => selected.add(i));
+  let result = [...selected]
+    .sort((a, b) => a - b)
+    .map((i) => lines[i])
+    .join('\n');
+  const maxChars = Math.min(Math.max(options.max_chars ?? 50000, 200), 100000);
+  const truncated = result.length > maxChars;
+  if (truncated) result = result.slice(-maxChars);
+  return {
+    logs: redactSensitiveText(result),
+    matched_lines: matching.length,
+    truncated,
+    total_lines: lines.length,
+  };
+}
+
+async function preflightApplicationMutation(
+  client: CoolifyClient,
+  uuid: string,
+  requestedAction: 'deploy' | 'start' | 'stop' | 'restart',
+): Promise<ApplicationMutationPreflight> {
+  const [application, deploymentEnvelope] = await Promise.all([
+    client.getApplication(uuid) as Promise<Record<string, any>>,
+    client.listApplicationDeployments(uuid),
+  ]);
+  const deployments = Array.isArray(deploymentEnvelope.deployments)
+    ? (deploymentEnvelope.deployments as Deployment[])
+    : [];
+  const activeDeployments = deployments.filter((deployment) => {
+    const status = String(deployment.status || '').toLowerCase();
+    return status === 'queued' || status === 'in_progress';
+  }).length;
+  const currentStatus = String(application.status || '');
+  const normalizedStatus = currentStatus.toLowerCase();
+  const isRunning = normalizedStatus.includes('running');
+
+  if (
+    (requestedAction === 'deploy' ||
+      requestedAction === 'start' ||
+      requestedAction === 'restart') &&
+    activeDeployments > 0
+  ) {
+    return {
+      uuid,
+      name: application.name,
+      requested_action: requestedAction,
+      effective_action: requestedAction,
+      status: 'blocked',
+      reason: 'deployment_in_progress',
+      current_status: currentStatus,
+      active_deployments: activeDeployments,
+    };
+  }
+
+  if (requestedAction === 'start' && isRunning) {
+    return {
+      uuid,
+      name: application.name,
+      requested_action: requestedAction,
+      effective_action: 'start',
+      status: 'noop',
+      reason: 'already_running',
+      current_status: currentStatus,
+      active_deployments: activeDeployments,
+    };
+  }
+
+  if (requestedAction === 'stop' && !isRunning) {
+    return {
+      uuid,
+      name: application.name,
+      requested_action: requestedAction,
+      effective_action: 'stop',
+      status: 'noop',
+      reason: 'already_stopped',
+      current_status: currentStatus,
+      active_deployments: activeDeployments,
+    };
+  }
+
+  if (requestedAction === 'restart' && !isRunning) {
+    return {
+      uuid,
+      name: application.name,
+      requested_action: requestedAction,
+      effective_action: 'start',
+      status: 'ready',
+      reason: 'restart_translated_to_start',
+      current_status: currentStatus,
+      active_deployments: activeDeployments,
+    };
+  }
+
+  return {
+    uuid,
+    name: application.name,
+    requested_action: requestedAction,
+    effective_action: requestedAction,
+    status: 'ready',
+    current_status: currentStatus,
+    active_deployments: activeDeployments,
+  };
 }
 
 /**
@@ -133,24 +508,14 @@ export function truncateLogs(
 export function getApplicationActions(uuid: string, status?: string): ResponseAction[] {
   const actions: ResponseAction[] = [
     { tool: 'application_logs', args: { uuid }, hint: 'View logs' },
+    { tool: 'wait_for_application', args: { uuid }, hint: 'Wait for ready status' },
   ];
   const s = (status || '').toLowerCase();
-  if (s.includes('running')) {
+  if (!s.includes('running')) {
     actions.push({
-      tool: 'control',
-      args: { resource: 'application', action: 'restart', uuid },
-      hint: 'Restart',
-    });
-    actions.push({
-      tool: 'control',
-      args: { resource: 'application', action: 'stop', uuid },
-      hint: 'Stop',
-    });
-  } else {
-    actions.push({
-      tool: 'control',
-      args: { resource: 'application', action: 'start', uuid },
-      hint: 'Start',
+      tool: 'deployment',
+      args: { action: 'list_for_app', uuid },
+      hint: 'Deployments',
     });
   }
   return actions;
@@ -169,6 +534,11 @@ export function getDeploymentActions(
   if (appUuid) {
     actions.push({ tool: 'get_application', args: { uuid: appUuid }, hint: 'View app' });
     actions.push({ tool: 'application_logs', args: { uuid: appUuid }, hint: 'App logs' });
+    actions.push({
+      tool: 'wait_for_application',
+      args: { uuid: appUuid },
+      hint: 'Wait for ready status',
+    });
   }
   return actions;
 }
@@ -216,58 +586,6 @@ function wrapWithActions<T>(
     }));
 }
 
-// =============================================================================
-// Deploy wait/poll helpers (#238)
-// =============================================================================
-
-/** Deployment statuses that end a run — polling stops once one of these is hit. */
-const TERMINAL_DEPLOYMENT_STATUSES: ReadonlySet<string> = new Set([
-  'finished',
-  'failed',
-  'cancelled',
-]);
-
-const DEFAULT_DEPLOY_TIMEOUT_SECONDS = 300;
-const DEPLOY_POLL_INTERVAL_MS = 5000;
-
-function isTerminalDeploymentStatus(status: string): boolean {
-  return TERMINAL_DEPLOYMENT_STATUSES.has(status);
-}
-
-/** Isolated so tests can drive polling with jest fake timers instead of real waits. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function durationSeconds(createdAt?: string, updatedAt?: string): number | undefined {
-  if (!createdAt || !updatedAt) return undefined;
-  const start = Date.parse(createdAt);
-  const end = Date.parse(updatedAt);
-  if (Number.isNaN(start) || Number.isNaN(end)) return undefined;
-  return Math.max(0, Math.round((end - start) / 1000));
-}
-
-/**
- * Small, safe projection returned by `deploy` when `wait: true`.
- * Built from essential fields + a bounded log tail only — never the raw
- * upstream deployment object, which can carry server/application secrets
- * (see #232).
- */
-interface DeployWaitResult {
-  status: string;
-  deployment_uuid: string;
-  application_uuid?: string;
-  commit?: string;
-  created_at?: string;
-  updated_at?: string;
-  duration_seconds?: number;
-  timed_out?: boolean;
-  logs_tail?: string;
-  logs_meta?: { total_entries: number; showing: string };
-  next_action?: string;
-  additional_deployment_uuids?: string[];
-}
-
 export class CoolifyMcpServer extends McpServer {
   private readonly client: CoolifyClient;
   private readonly docsSearch: DocsSearchEngine = new DocsSearchEngine();
@@ -280,94 +598,6 @@ export class CoolifyMcpServer extends McpServer {
 
   async connect(transport: Transport): Promise<void> {
     await super.connect(transport);
-  }
-
-  /**
-   * Poll a single deployment until it reaches a terminal status or the
-   * timeout elapses. Uses `getDeployment`'s no-logs projection
-   * (`DeploymentEssential`) while polling, and only fetches logs (once,
-   * truncated) if the deployment failed.
-   */
-  private async pollDeployment(uuid: string, timeoutSeconds: number): Promise<DeployWaitResult> {
-    const deadline = Date.now() + timeoutSeconds * 1000;
-    let current = (await this.client.getDeployment(uuid)) as DeploymentEssential;
-
-    while (!isTerminalDeploymentStatus(current.status) && Date.now() < deadline) {
-      await sleep(DEPLOY_POLL_INTERVAL_MS);
-      current = (await this.client.getDeployment(uuid)) as DeploymentEssential;
-    }
-
-    if (!isTerminalDeploymentStatus(current.status)) {
-      return {
-        status: current.status,
-        deployment_uuid: uuid,
-        application_uuid: current.application_uuid,
-        timed_out: true,
-        next_action: `Still "${current.status}" after ${timeoutSeconds}s — poll \`deployment\` (action: "get", uuid: "${uuid}") to keep watching.`,
-      };
-    }
-
-    if (current.status === 'failed') {
-      const withLogs = (await this.client.getDeployment(uuid, {
-        includeLogs: true,
-      })) as Deployment;
-      const tail = withLogs.logs ? truncateLogs(withLogs.logs, 30, 10_000) : undefined;
-      return {
-        status: current.status,
-        deployment_uuid: uuid,
-        application_uuid: current.application_uuid,
-        commit: current.commit,
-        created_at: current.created_at,
-        updated_at: current.updated_at,
-        duration_seconds: durationSeconds(current.created_at, current.updated_at),
-        logs_tail: tail?.logs,
-        logs_meta: tail
-          ? {
-              total_entries: tail.total,
-              showing: `${tail.showing_start}-${tail.showing_end} of ${tail.total}`,
-            }
-          : undefined,
-        next_action: `Deployment failed. See logs_tail above, or \`deployment\` (action: "get", uuid: "${uuid}", lines: N) for more.`,
-      };
-    }
-
-    return {
-      status: current.status,
-      deployment_uuid: uuid,
-      application_uuid: current.application_uuid,
-      commit: current.commit,
-      created_at: current.created_at,
-      updated_at: current.updated_at,
-      duration_seconds: durationSeconds(current.created_at, current.updated_at),
-    };
-  }
-
-  /**
-   * Trigger a deploy and wait for it to finish. A tag can resolve to
-   * multiple applications, so `deployByTagOrUuid` may return several
-   * `deployment_uuid`s — only the first is polled; any others are
-   * surfaced under `additional_deployment_uuids` for the caller to check
-   * separately via `deployment get`.
-   */
-  private async triggerAndWaitForDeploy(
-    tagOrUuid: string,
-    force: boolean | undefined,
-    timeoutSeconds: number,
-  ): Promise<DeployWaitResult | DeployTriggerResponse> {
-    const triggered = await this.client.deployByTagOrUuid(tagOrUuid, force);
-    const [first, ...rest] = triggered.deployments ?? [];
-
-    if (!first?.deployment_uuid) {
-      // Nothing to poll against — hand back the trigger response as-is.
-      return triggered;
-    }
-
-    const result = await this.pollDeployment(first.deployment_uuid, timeoutSeconds);
-    const additional = rest.map((d) => d.deployment_uuid).filter((u): u is string => !!u);
-    if (additional.length > 0) {
-      result.additional_deployment_uuids = additional;
-    }
-    return result;
   }
 
   private registerTools(): void {
@@ -577,24 +807,35 @@ export class CoolifyMcpServer extends McpServer {
         ),
     );
 
-    this.tool('get_application', 'App details', { uuid: z.string() }, async ({ uuid }) =>
-      wrapWithActions(
-        () => this.client.getApplication(uuid),
-        (app) => getApplicationActions(app.uuid, app.status),
-      ),
+    this.tool(
+      'get_application',
+      'App status/details with sensitive fields redacted',
+      { uuid: z.string() },
+      async ({ uuid }) =>
+        wrapWithActions(
+          async () =>
+            summarizeApplicationForRead(
+              (await this.client.getApplication(uuid)) as Record<string, any>,
+            ),
+          (app) =>
+            getApplicationActions(
+              String((app as Record<string, unknown>).uuid || ''),
+              String((app as Record<string, unknown>).status || ''),
+            ),
+        ),
     );
 
     this.tool(
       'application',
-      'Manage app: create/update/delete/delete_preview',
+      'Manage app: create/update/delete/deploy/delete_preview',
       {
         action: z.enum([
           'create_public',
           'create_github',
           'create_key',
           'create_dockerimage',
-          'create_dockerfile',
           'update',
+          'deploy',
           'delete',
           'delete_preview',
         ]),
@@ -614,8 +855,6 @@ export class CoolifyMcpServer extends McpServer {
         // Docker image fields
         docker_registry_image_name: z.string().optional(),
         docker_registry_image_tag: z.string().optional(),
-        // Dockerfile fields (create_dockerfile)
-        dockerfile: z.string().optional(),
         // Update fields
         name: z.string().optional(),
         description: z.string().optional(),
@@ -623,13 +862,8 @@ export class CoolifyMcpServer extends McpServer {
         domains: z.string().optional(),
         custom_docker_run_options: z.string().optional(),
         custom_labels: z.string().optional(),
-        custom_network_aliases: z
-          .string()
-          .optional()
-          .describe(
-            'Comma-separated DNS aliases for app-to-app traffic (update only). App containers have no stable uuid hostname — only databases do.',
-          ),
         instant_deploy: z.boolean().optional(),
+        force: z.boolean().optional(),
         // Health check fields
         health_check_enabled: z.boolean().optional(),
         health_check_path: z.string().optional(),
@@ -884,37 +1118,6 @@ export class CoolifyMcpServer extends McpServer {
                 instant_deploy: args.instant_deploy,
               }),
             );
-          case 'create_dockerfile':
-            if (!args.project_uuid || !args.server_uuid || !args.dockerfile) {
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: 'Error: project_uuid, server_uuid, dockerfile required',
-                  },
-                ],
-              };
-            }
-            return wrap(() =>
-              this.client.createApplicationDockerfile({
-                project_uuid: args.project_uuid!,
-                server_uuid: args.server_uuid!,
-                destination_uuid: args.destination_uuid,
-                dockerfile: args.dockerfile!,
-                dockerfile_location: args.dockerfile_location,
-                ports_exposes: args.ports_exposes,
-                base_directory: args.base_directory,
-                environment_name: args.environment_name,
-                environment_uuid: args.environment_uuid,
-                name: args.name,
-                description: args.description,
-                fqdn: args.fqdn,
-                domains: args.domains,
-                custom_docker_run_options: args.custom_docker_run_options,
-                custom_labels: args.custom_labels,
-                instant_deploy: args.instant_deploy,
-              }),
-            );
           case 'update': {
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
@@ -922,6 +1125,24 @@ export class CoolifyMcpServer extends McpServer {
             const { action: _, uuid: __, delete_volumes: ___, ...updateData } = args;
             return wrap(() => this.client.updateApplication(uuid, updateData));
           }
+          case 'deploy':
+            if (!uuid)
+              return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
+            return wrapWithActions(
+              () => this.client.deployByTagOrUuid(uuid, Boolean(args.force)),
+              (): ResponseAction[] => [
+                {
+                  tool: 'deployment',
+                  args: { action: 'list_for_app', uuid },
+                  hint: 'Check deployments',
+                },
+                {
+                  tool: 'wait_for_application',
+                  args: { uuid },
+                  hint: 'Wait for ready status',
+                },
+              ],
+            );
           case 'delete':
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
@@ -940,9 +1161,57 @@ export class CoolifyMcpServer extends McpServer {
 
     this.tool(
       'application_logs',
-      'Get app logs',
-      { uuid: z.string(), lines: z.number().optional() },
-      async ({ uuid, lines }) => wrap(() => this.client.getApplicationLogs(uuid, lines)),
+      'Get bounded app logs with automatic secret redaction, search/regex filtering, timestamp range, context lines, exception/warning modes, and ANSI removal.',
+      {
+        uuid: z.string(),
+        lines: z.number().optional(),
+        search: z.string().optional(),
+        search_regex: z.boolean().optional(),
+        case_sensitive: z.boolean().optional(),
+        context_before: z.number().optional(),
+        context_after: z.number().optional(),
+        exception_only: z.boolean().optional(),
+        warning_only: z.boolean().optional(),
+        remove_ansi: z.boolean().optional(),
+        from: z.string().optional(),
+        to: z.string().optional(),
+        max_chars: z.number().optional(),
+      },
+      async ({ uuid, lines, ...options }) =>
+        wrap(async () => ({
+          uuid,
+          lines_requested: lines ?? 100,
+          redacted: true,
+          ...filterLogText(await this.client.getApplicationLogs(uuid, lines), options),
+          identifiers: { coolify_application_uuid: uuid },
+        })),
+    );
+
+    this.tool(
+      'wait_for_application',
+      'Poll app status until it is ready and deployments finish',
+      {
+        uuid: z.string(),
+        desired_statuses: z.array(z.string()).optional(),
+        timeout_ms: z.number().optional(),
+        poll_interval_ms: z.number().optional(),
+        require_no_running_deployments: z.boolean().optional(),
+      },
+      async ({
+        uuid,
+        desired_statuses,
+        timeout_ms,
+        poll_interval_ms,
+        require_no_running_deployments,
+      }) =>
+        wrap(() =>
+          this.client.waitForApplication(uuid, {
+            desiredStatuses: desired_statuses,
+            timeoutMs: timeout_ms,
+            pollIntervalMs: poll_interval_ms,
+            requireNoRunningDeployments: require_no_running_deployments,
+          }),
+        ),
     );
 
     // =========================================================================
@@ -981,10 +1250,6 @@ export class CoolifyMcpServer extends McpServer {
         server_uuid: z.string().optional(),
         project_uuid: z.string().optional(),
         environment_name: z.string().optional(),
-        destination_uuid: z
-          .string()
-          .optional()
-          .describe('Destination UUID. Required if server has multiple destinations.'),
         name: z.string().optional(),
         description: z.string().optional(),
         image: z.string().optional(),
@@ -1057,6 +1322,76 @@ export class CoolifyMcpServer extends McpServer {
     );
 
     this.tool(
+      'get_service_compose',
+      'Read an existing service Docker Compose file with secrets and environment values redacted',
+      { uuid: z.string() },
+      async ({ uuid }) =>
+        wrap(async () => {
+          const result = await this.client.getServiceCompose(uuid);
+          const compose = decodeCompose(result.docker_compose_raw);
+          return {
+            uuid,
+            docker_compose_raw: redactCompose(compose),
+            expected_hash: composeHash(compose),
+            secrets_redacted: true,
+          };
+        }),
+    );
+
+    this.tool(
+      'update_service_compose',
+      'Validate and preview a service Docker Compose update; writing requires apply=true and the current expected_hash',
+      {
+        uuid: z.string(),
+        docker_compose_raw: z.string(),
+        expected_hash: z.string().regex(/^[a-f0-9]{64}$/i),
+        dry_run: z.boolean().default(true),
+        apply: z.boolean().default(false),
+      },
+      async ({ uuid, docker_compose_raw, expected_hash, dry_run, apply }) =>
+        wrap(async () => {
+          validateCompose(docker_compose_raw);
+          const current = await this.client.getServiceCompose(uuid);
+          const currentCompose = decodeCompose(current.docker_compose_raw);
+          const currentHash = composeHash(currentCompose);
+          if (currentHash !== expected_hash) {
+            throw new Error(
+              `Concurrent change detected: expected_hash does not match current service compose hash (${currentHash})`,
+            );
+          }
+          const diff = redactedComposeDiff(currentCompose, docker_compose_raw);
+          if (dry_run || !apply) {
+            return {
+              uuid,
+              dry_run: true,
+              applied: false,
+              expected_hash,
+              diff,
+              verification: { yaml_valid: true, hash_match: true, secrets_redacted: true },
+            };
+          }
+          const updated = await this.client.updateServiceCompose(uuid, docker_compose_raw);
+          const verified = await this.client.getServiceCompose(uuid);
+          const verifiedCompose = decodeCompose(verified.docker_compose_raw);
+          return {
+            uuid,
+            dry_run: false,
+            applied: true,
+            expected_hash,
+            diff,
+            verification: {
+              yaml_valid: true,
+              hash_match: true,
+              persisted_hash: composeHash(verifiedCompose),
+              persisted: verifiedCompose === docker_compose_raw,
+              secrets_redacted: true,
+            },
+            result: { uuid: updated.uuid },
+          };
+        }),
+    );
+
+    this.tool(
       'service',
       'Manage service: create/update/delete',
       {
@@ -1118,17 +1453,14 @@ export class CoolifyMcpServer extends McpServer {
     // =========================================================================
     this.tool(
       'control',
-      'Start/stop/restart app, database, or service',
+      'Start/stop/restart app, database, or service with dry-run support and duplicate-operation guardrails',
       {
         resource: z.enum(['application', 'database', 'service']),
         action: z.enum(['start', 'stop', 'restart']),
         uuid: z.string(),
-        pull_latest: z
-          .boolean()
-          .optional()
-          .describe('Pull latest images before restarting (services only)'),
+        dry_run: z.boolean().optional(),
       },
-      async ({ resource, action, uuid, pull_latest }) => {
+      async ({ resource, action, uuid, dry_run }) => {
         const methods: Record<string, Record<string, (u: string) => Promise<unknown>>> = {
           application: {
             start: (u) => this.client.startApplication(u),
@@ -1143,7 +1475,7 @@ export class CoolifyMcpServer extends McpServer {
           service: {
             start: (u) => this.client.startService(u),
             stop: (u) => this.client.stopService(u),
-            restart: (u) => this.client.restartService(u, pull_latest),
+            restart: (u) => this.client.restartService(u),
           },
         };
 
@@ -1153,19 +1485,11 @@ export class CoolifyMcpServer extends McpServer {
           if (resource === 'application') {
             actions.push({ tool: 'application_logs', args: { uuid }, hint: 'View logs' });
             actions.push({ tool: 'get_application', args: { uuid }, hint: 'Check status' });
-            if (action === 'start' || action === 'restart') {
-              actions.push({
-                tool: 'control',
-                args: { resource: 'application', action: 'stop', uuid },
-                hint: 'Stop',
-              });
-            } else {
-              actions.push({
-                tool: 'control',
-                args: { resource: 'application', action: 'start', uuid },
-                hint: 'Start',
-              });
-            }
+            actions.push({
+              tool: 'wait_for_application',
+              args: { uuid },
+              hint: 'Wait for ready status',
+            });
           } else if (resource === 'database') {
             actions.push({ tool: 'get_database', args: { uuid }, hint: 'Check status' });
           } else if (resource === 'service') {
@@ -1174,7 +1498,40 @@ export class CoolifyMcpServer extends McpServer {
           return actions;
         };
 
-        return wrapWithActions(() => methods[resource][action](uuid), getControlActions);
+        if (resource === 'application') {
+          return wrapWithActions(async () => {
+            const preflight = await preflightApplicationMutation(this.client, uuid, action);
+            if (dry_run || preflight.status !== 'ready') {
+              return {
+                ...preflight,
+                dry_run: Boolean(dry_run),
+                executed: false,
+              };
+            }
+            const result = await methods.application[preflight.effective_action](uuid);
+            return {
+              ...preflight,
+              dry_run: false,
+              executed: true,
+              result,
+            };
+          }, getControlActions);
+        }
+
+        return wrapWithActions(async () => {
+          if (dry_run) {
+            return {
+              uuid,
+              resource,
+              requested_action: action,
+              effective_action: action,
+              status: 'ready',
+              dry_run: true,
+              executed: false,
+            };
+          }
+          return methods[resource][action](uuid);
+        }, getControlActions);
       },
     );
 
@@ -1317,11 +1674,18 @@ export class CoolifyMcpServer extends McpServer {
     // =========================================================================
     this.tool(
       'list_deployments',
-      'List deployments (summary)',
-      { page: z.number().optional(), per_page: z.number().optional() },
-      async ({ page, per_page }) =>
+      'List deployments. Default scope is recent deployments aggregated per app; use scope=active for Coolify queue-only view.',
+      {
+        page: z.number().optional(),
+        per_page: z.number().optional(),
+        scope: z.enum(['recent', 'active']).optional(),
+      },
+      async ({ page, per_page, scope }) =>
         wrapWithActions(
-          () => this.client.listDeployments({ page, per_page, summary: true }),
+          () =>
+            scope === 'active'
+              ? this.client.listDeployments({ page, per_page, summary: true })
+              : this.client.listRecentDeployments({ page, per_page }),
           undefined,
           (result) =>
             getPagination('list_deployments', page, per_page, (result as unknown[]).length),
@@ -1330,43 +1694,49 @@ export class CoolifyMcpServer extends McpServer {
 
     this.tool(
       'deploy',
-      'Deploy by tag/UUID',
-      {
-        tag_or_uuid: z.string(),
-        force: z.boolean().optional(),
-        wait: z
-          .boolean()
-          .optional()
-          .describe(
-            'Wait for the deployment to reach a terminal status (finished/failed/cancelled) instead of returning immediately, polling every ~5s. If tag_or_uuid matches multiple applications (a tag can trigger several deployments), only the first is watched — the rest are returned under additional_deployment_uuids for you to check separately via `deployment get`. On failure the response includes a bounded log tail. Default false (fire-and-forget, unchanged response).',
-          ),
-        timeout_seconds: z
-          .number()
-          .optional()
-          .describe(
-            'Max seconds to poll when wait is true before giving up and returning the current status plus a next-action hint (default 300). Ignored when wait is false.',
-          ),
-      },
-      async ({ tag_or_uuid, force, wait, timeout_seconds }) => {
-        if (!wait) {
-          return wrapWithActions(
-            () => this.client.deployByTagOrUuid(tag_or_uuid, force),
-            () => [{ tool: 'list_deployments', args: {}, hint: 'Check deployment status' }],
-          );
-        }
-        return wrapWithActions(
-          () =>
-            this.triggerAndWaitForDeploy(
+      'Deploy by tag/UUID with dry-run support and duplicate-deployment guardrails',
+      { tag_or_uuid: z.string(), force: z.boolean().optional(), dry_run: z.boolean().optional() },
+      async ({ tag_or_uuid, force, dry_run }) =>
+        wrapWithActions(
+          async () => {
+            const isUuid =
+              /^[a-z0-9]{20,}$/i.test(tag_or_uuid) || /^[0-9a-f-]{36}$/i.test(tag_or_uuid);
+            if (!isUuid) {
+              if (dry_run) {
+                return {
+                  tag_or_uuid,
+                  requested_action: 'deploy',
+                  status: 'ready',
+                  dry_run: true,
+                  executed: false,
+                };
+              }
+              return this.client.deployByTagOrUuid(tag_or_uuid, force);
+            }
+
+            const preflight = await preflightApplicationMutation(
+              this.client,
               tag_or_uuid,
-              force,
-              timeout_seconds ?? DEFAULT_DEPLOY_TIMEOUT_SECONDS,
-            ),
-          (result) =>
-            'deployment_uuid' in result
-              ? getDeploymentActions(result.deployment_uuid, result.status, result.application_uuid)
-              : [],
-        );
-      },
+              'deploy',
+            );
+            if (dry_run || preflight.status !== 'ready') {
+              return {
+                ...preflight,
+                dry_run: Boolean(dry_run),
+                executed: false,
+              };
+            }
+
+            const result = await this.client.deployByTagOrUuid(tag_or_uuid, force);
+            return {
+              ...preflight,
+              dry_run: false,
+              executed: true,
+              result,
+            };
+          },
+          () => [{ tool: 'list_deployments', args: {}, hint: 'Check deployment status' }],
+        ),
     );
 
     this.tool(
@@ -1379,8 +1749,48 @@ export class CoolifyMcpServer extends McpServer {
         page: z.number().optional(), // Log page (1=most recent, 2=older, etc.)
         max_chars: z.number().optional(), // Limit log output to last N chars (default: 50000)
         include_logs: z.boolean().optional(), // list_for_app only: include raw build logs (default false; upstream returns ~30KB per deployment)
+        search: z.string().optional(),
+        search_regex: z.boolean().optional(),
+        case_sensitive: z.boolean().optional(),
+        context_before: z.number().optional(),
+        context_after: z.number().optional(),
+        exception_only: z.boolean().optional(),
+        warning_only: z.boolean().optional(),
+        remove_ansi: z.boolean().optional(),
+        from: z.string().optional(),
+        to: z.string().optional(),
       },
-      async ({ action, uuid, lines, page, max_chars, include_logs }) => {
+      async ({
+        action,
+        uuid,
+        lines,
+        page,
+        max_chars,
+        include_logs,
+        search,
+        search_regex,
+        case_sensitive,
+        context_before,
+        context_after,
+        exception_only,
+        warning_only,
+        remove_ansi,
+        from,
+        to,
+      }) => {
+        const logOptions = {
+          search,
+          search_regex,
+          case_sensitive,
+          context_before,
+          context_after,
+          exception_only,
+          warning_only,
+          remove_ansi,
+          from,
+          to,
+          max_chars,
+        };
         switch (action) {
           case 'get':
             // If lines param specified, include logs and truncate
@@ -1389,25 +1799,38 @@ export class CoolifyMcpServer extends McpServer {
               const ll = lines;
               return wrapWithActions(
                 async () => {
-                  const deployment = await this.client.getDeployment(uuid, {
+                  const deployment = (await this.client.getDeployment(uuid, {
                     includeLogs: true,
-                  });
+                  })) as Record<string, any>;
                   if (deployment.logs) {
-                    const result = truncateLogs(deployment.logs, ll, max_chars ?? 50000, p);
-                    deployment.logs = result.logs;
+                    const result = truncateLogs(
+                      filterLogText(String(deployment.logs), logOptions).logs,
+                      ll,
+                      max_chars ?? 50000,
+                      p,
+                    );
                     return {
-                      ...deployment,
-                      logs_meta: {
-                        total_entries: result.total,
-                        showing: `${result.showing_start}-${result.showing_end} of ${result.total}`,
-                      },
+                      ...summarizeDeploymentForRead(deployment, {
+                        logs: result.logs,
+                        logs_meta: {
+                          total_entries: result.total,
+                          showing: `${result.showing_start}-${result.showing_end} of ${result.total}`,
+                          chars: result.logs.length,
+                        },
+                      }),
+                      identifiers: deploymentIdentifiers(deployment),
                     };
                   }
-                  return { ...deployment, logs_meta: undefined };
+                  return summarizeDeploymentForRead(deployment);
                 },
-                (dep) => getDeploymentActions(dep.uuid, dep.status, dep.application_uuid),
+                (dep) =>
+                  getDeploymentActions(
+                    String((dep as SafeDeploymentRead).deployment_uuid || ''),
+                    String((dep as SafeDeploymentRead).status || ''),
+                    String((dep as SafeDeploymentRead).application_uuid || ''),
+                  ),
                 (dep) => {
-                  const total = dep.logs_meta?.total_entries ?? 0;
+                  const total = (dep as SafeDeploymentRead).logs_meta?.total_entries ?? 0;
                   const hasOlder = p * ll < total;
                   const pagination: ResponsePagination = {};
                   if (hasOlder)
@@ -1426,15 +1849,56 @@ export class CoolifyMcpServer extends McpServer {
             }
             // Otherwise return essential info without logs
             return wrapWithActions(
-              () => this.client.getDeployment(uuid),
-              (dep) => getDeploymentActions(dep.uuid, dep.status, dep.application_uuid),
+              async () => ({
+                ...summarizeDeploymentForRead(
+                  (await this.client.getDeployment(uuid, {
+                    includeLogs: true,
+                  })) as Record<string, any>,
+                ),
+                identifiers: { coolify_deployment_uuid: uuid },
+              }),
+              (dep) =>
+                getDeploymentActions(
+                  String((dep as SafeDeploymentRead).deployment_uuid || ''),
+                  String((dep as SafeDeploymentRead).status || ''),
+                  String((dep as SafeDeploymentRead).application_uuid || ''),
+                ),
             );
           case 'cancel':
             return wrap(() => this.client.cancelDeployment(uuid));
           case 'list_for_app':
-            return wrap(() =>
-              this.client.listApplicationDeployments(uuid, { includeLogs: include_logs }),
-            );
+            return wrap(async () => {
+              const envelope = await this.client.listApplicationDeployments(uuid, {
+                includeLogs: include_logs,
+              });
+              const deployments = Array.isArray(envelope.deployments) ? envelope.deployments : [];
+              return {
+                count: envelope.count,
+                deployments: deployments.map((deployment) => {
+                  const rawDeployment = deployment as Record<string, any>;
+                  if (include_logs && rawDeployment.logs) {
+                    const excerpt = truncateLogs(
+                      filterLogText(String(rawDeployment.logs), logOptions).logs,
+                      20,
+                      4000,
+                      1,
+                    );
+                    return {
+                      ...summarizeDeploymentForRead(rawDeployment, {
+                        logs: excerpt.logs,
+                        logs_meta: {
+                          total_entries: excerpt.total,
+                          showing: `${excerpt.showing_start}-${excerpt.showing_end} of ${excerpt.total}`,
+                          chars: excerpt.logs.length,
+                        },
+                      }),
+                      identifiers: deploymentIdentifiers(rawDeployment),
+                    };
+                  }
+                  return summarizeDeploymentForRead(rawDeployment);
+                }),
+              };
+            });
         }
       },
     );
@@ -1872,35 +2336,18 @@ export class CoolifyMcpServer extends McpServer {
     // =========================================================================
     this.tool(
       'scheduled_tasks',
-      'Manage scheduled tasks for app or service: list/create/update/delete/list_executions/run_once. ' +
-        "list_executions: the command's stdout comes back in the execution's message field. " +
-        'run_once: composite that creates a throwaway "* * * * *" task, polls list_executions every ~5s ' +
-        'for the first terminal execution (or until wait_seconds elapses, default 90), deletes the task, ' +
-        'and returns status+message. WARNING: the underlying cron may fire more than once before cleanup ' +
-        'completes — make the command idempotent (e.g. `where not exists`) or tolerate re-execution. ' +
-        'Coolify stores `command` in a varchar(255) column and rejects longer commands with a bodyless ' +
-        'HTTP 500 — keep commands to 255 chars or fewer (#234).',
+      'Manage scheduled tasks for app or service: list/create/update/delete/list_executions',
       {
         resource: z.enum(['application', 'service']),
-        action: z.enum(['list', 'create', 'update', 'delete', 'list_executions', 'run_once']),
+        action: z.enum(['list', 'create', 'update', 'delete', 'list_executions']),
         uuid: z.string(),
         task_uuid: z.string().optional(),
         name: z.string().optional(),
-        command: z
-          .string()
-          .max(
-            255,
-            'Coolify rejects scheduled-task commands longer than 255 chars — split the command or bake a script into the container image',
-          )
-          .optional(),
+        command: z.string().optional(),
         frequency: z.string().optional(),
         container: z.string().optional(),
         timeout: z.number().optional(),
         enabled: z.boolean().optional(),
-        wait_seconds: z
-          .number()
-          .optional()
-          .describe('run_once only: poll budget in seconds before giving up (default 90)'),
       },
       async (args) => {
         const { resource, action, uuid, task_uuid } = args;
@@ -1963,19 +2410,6 @@ export class CoolifyMcpServer extends McpServer {
               isApp
                 ? this.client.listApplicationScheduledTaskExecutions(uuid, task_uuid)
                 : this.client.listServiceScheduledTaskExecutions(uuid, task_uuid),
-            );
-          case 'run_once':
-            if (!args.command || !args.container)
-              return {
-                content: [{ type: 'text' as const, text: 'Error: command, container required' }],
-              };
-            return this.runOnceScheduledTask(
-              resource,
-              uuid,
-              args.command,
-              args.container,
-              args.timeout,
-              args.wait_seconds,
             );
         }
       },
@@ -2076,7 +2510,7 @@ export class CoolifyMcpServer extends McpServer {
     // =========================================================================
     this.tool(
       'system',
-      'System operations: health/list_resources/enable_api/disable_api. `list_resources` defaults to an essential projection (uuid/name/type/status) to keep token budgets sane on instances with many resources; pass `include_full: true` for the raw Coolify payload. When `include_full: true`, credentials are masked unless `reveal: true` is also set (matches the `env_vars` `reveal` ergonomics): webhook HMAC secrets, basic-auth password, database passwords, internal/external_db_url connection strings, compose bodies, custom_labels, and nested env-var values.',
+      'System operations: health/list_resources/enable_api/disable_api. `list_resources` defaults to an essential projection (uuid/name/type/status) to keep token budgets sane on instances with many resources; pass `include_full: true` for the raw Coolify payload. When `include_full: true`, webhook HMAC secrets and basic-auth password are masked unless `reveal: true` is also set (matches the `env_vars` `reveal` ergonomics).',
       {
         action: z.enum(['health', 'list_resources', 'enable_api', 'disable_api']),
         include_full: z.boolean().optional(),
@@ -2158,149 +2592,5 @@ export class CoolifyMcpServer extends McpServer {
       async ({ project_uuid, force }) =>
         wrap(() => this.client.redeployProjectApps(project_uuid, force ?? true)),
     );
-  }
-
-  /**
-   * Injectable delay for the run_once poll loop. A real setTimeout in production;
-   * tests replace it with `jest.spyOn(server, 'sleep').mockResolvedValue(undefined)`
-   * so polling logic runs without waiting on the wall clock.
-   */
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Composite one-off command execution (#233 / #208): there is no upstream
-   * "run now" endpoint for scheduled tasks, so this creates a throwaway
-   * `* * * * *` task, polls list_executions until the first execution reaches a
-   * terminal status (or the poll budget runs out), and returns its status+message.
-   *
-   * The task is deleted in a finally-equivalent (try/finally-style) block so cleanup
-   * always runs — on success, on timeout, and on a polling error. If cleanup itself
-   * fails, the returned message says so loudly with the task UUID so a human can
-   * remove it manually (it would otherwise keep firing every minute).
-   */
-  private async runOnceScheduledTask(
-    resource: 'application' | 'service',
-    uuid: string,
-    command: string,
-    container: string,
-    timeout: number | undefined,
-    waitSeconds: number | undefined,
-  ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-    const isApp = resource === 'application';
-    const pollIntervalMs = 5000;
-    const budgetSeconds = waitSeconds ?? 90;
-    const maxAttempts = Math.max(1, Math.ceil((budgetSeconds * 1000) / pollIntervalMs));
-    const name = `oneoff-${Math.random().toString(36).slice(2, 10)}`;
-
-    let taskUuid: string;
-    try {
-      const task = isApp
-        ? await this.client.createApplicationScheduledTask(uuid, {
-            name,
-            command,
-            frequency: '* * * * *',
-            container,
-            timeout,
-            enabled: true,
-          })
-        : await this.client.createServiceScheduledTask(uuid, {
-            name,
-            command,
-            frequency: '* * * * *',
-            container,
-            timeout,
-            enabled: true,
-          });
-      taskUuid = task.uuid;
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: `Error creating one-off task: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-
-    let execution: ScheduledTaskExecution | undefined;
-    let pollErrorMessage: string | undefined;
-
-    try {
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const executions = isApp
-          ? await this.client.listApplicationScheduledTaskExecutions(uuid, taskUuid)
-          : await this.client.listServiceScheduledTaskExecutions(uuid, taskUuid);
-        const first = executions[0];
-        if (first && first.status !== 'running') {
-          execution = first;
-          break;
-        }
-        if (attempt < maxAttempts - 1) await this.sleep(pollIntervalMs);
-      }
-    } catch (error) {
-      pollErrorMessage = error instanceof Error ? error.message : String(error);
-    }
-
-    // Cleanup always runs, regardless of how the poll loop above ended.
-    let deleteErrorMessage: string | undefined;
-    try {
-      if (isApp) {
-        await this.client.deleteApplicationScheduledTask(uuid, taskUuid);
-      } else {
-        await this.client.deleteServiceScheduledTask(uuid, taskUuid);
-      }
-    } catch (error) {
-      deleteErrorMessage = error instanceof Error ? error.message : String(error);
-    }
-
-    const cleanupNote = deleteErrorMessage
-      ? `WARNING: failed to delete one-off task ${taskUuid} — it will keep firing every minute ` +
-        `until it is removed manually. Delete error: ${deleteErrorMessage}`
-      : `One-off task ${taskUuid} deleted.`;
-
-    if (pollErrorMessage) {
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: `Error polling one-off task ${taskUuid} executions: ${pollErrorMessage}. ${cleanupNote}`,
-          },
-        ],
-      };
-    }
-
-    if (!execution) {
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text:
-              `Timed out after ${budgetSeconds}s waiting for one-off task ${taskUuid} to produce ` +
-              `an execution. ${cleanupNote}`,
-          },
-        ],
-      };
-    }
-
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify(
-            {
-              status: execution.status,
-              message: execution.message,
-              task_uuid: taskUuid,
-              cleanup: cleanupNote,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
   }
 }

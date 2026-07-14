@@ -114,6 +114,7 @@ import type {
   ResourceListItem,
   ResourceListItemFull,
 } from '../types/coolify.js';
+import { createHash } from 'node:crypto';
 
 // =============================================================================
 // List Options & Summary Types
@@ -192,6 +193,29 @@ export interface GitHubAppSummary {
   app_id: number | null;
 }
 
+export interface WaitForApplicationOptions {
+  desiredStatuses?: string[];
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  requireNoRunningDeployments?: boolean;
+}
+
+export interface WaitForApplicationResult {
+  outcome: 'ready' | 'timeout';
+  uuid: string;
+  application_status: string | null;
+  matched_status: string | null;
+  active_deployments: number;
+  poll_count: number;
+  elapsed_ms: number;
+  last_deployment: DeploymentEssential | null;
+}
+
+export interface RecentDeploymentsOptions {
+  page?: number;
+  per_page?: number;
+}
+
 /**
  * Remove undefined values from an object.
  * Keeps explicit false values so features like HTTP Basic Auth can be disabled.
@@ -217,6 +241,20 @@ function toBase64(value: string): string {
     // Not base64, encode it
   }
   return Buffer.from(value, 'utf-8').toString('base64');
+}
+
+export function decodeCompose(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  try {
+    const decoded = Buffer.from(value, 'base64').toString('utf8');
+    return Buffer.from(decoded, 'utf8').toString('base64') === value ? decoded : value;
+  } catch {
+    return value;
+  }
+}
+
+export function composeHash(compose: string): string {
+  return createHash('sha256').update(compose, 'utf8').digest('hex');
 }
 
 /**
@@ -375,6 +413,51 @@ function toEnvVarSummary(envVar: EnvironmentVariable): EnvVarSummary {
  * non-real string as "value not returned".
  */
 const MASKED_VALUE = '***';
+
+const SENSITIVE_TEXT_REPLACEMENTS: Array<{ pattern: RegExp; replacement: string }> = [
+  {
+    pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    replacement: '***REDACTED PRIVATE KEY***',
+  },
+  {
+    pattern: /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g,
+    replacement: '***REDACTED GITHUB TOKEN***',
+  },
+  {
+    pattern: /\bAKIA[0-9A-Z]{16}\b/g,
+    replacement: '***REDACTED AWS KEY***',
+  },
+  {
+    pattern: /\bsk-(?:live|proj|ant)-[A-Za-z0-9]{16,}\b/g,
+    replacement: '***REDACTED API KEY***',
+  },
+  {
+    pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
+    replacement: '***REDACTED SLACK TOKEN***',
+  },
+  {
+    pattern: /\bBearer\s+[A-Za-z0-9._\-+/=]{12,}\b/gi,
+    replacement: 'Bearer ***REDACTED***',
+  },
+  {
+    pattern:
+      /^([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*[:=]\s*).+$/gm,
+    replacement: '$1***REDACTED***',
+  },
+  {
+    pattern:
+      /\b((?:access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|webhook[_-]?secret|password|private[_-]?key)\b\s*[:=]\s*)(['"]?)[^'",\s]+(\2)/gi,
+    replacement: '$1$2***REDACTED***$3',
+  },
+];
+
+export function redactSensitiveText(text: string): string {
+  let redacted = text;
+  for (const { pattern, replacement } of SENSITIVE_TEXT_REPLACEMENTS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  return redacted;
+}
 
 /**
  * Mask the `value` and `real_value` fields on a full {@link EnvironmentVariable}.
@@ -928,7 +1011,9 @@ export class CoolifyClient {
   }
 
   async getApplicationLogs(uuid: string, lines: number = 100): Promise<string> {
-    return this.request<string>(`/applications/${uuid}/logs?lines=${lines}`);
+    const logs = await this.request<unknown>(`/applications/${uuid}/logs?lines=${lines}`);
+    const serialized = typeof logs === 'string' ? logs : JSON.stringify(logs, null, 2);
+    return redactSensitiveText(serialized);
   }
 
   async startApplication(
@@ -1138,6 +1223,15 @@ export class CoolifyClient {
     return this.request<Service>(`/services/${uuid}`);
   }
 
+  async getServiceCompose(uuid: string): Promise<{ uuid: string; docker_compose_raw: string }> {
+    const service = (await this.getService(uuid)) as Service & { docker_compose_raw?: string };
+    return { uuid, docker_compose_raw: decodeCompose(service.docker_compose_raw) };
+  }
+
+  async updateServiceCompose(uuid: string, docker_compose_raw: string): Promise<Service> {
+    return this.updateService(uuid, { docker_compose_raw });
+  }
+
   async createService(data: CreateServiceRequest): Promise<ServiceCreateResponse> {
     const payload = { ...data };
     if (payload.docker_compose_raw) {
@@ -1245,6 +1339,36 @@ export class CoolifyClient {
       : deployments;
   }
 
+  async listRecentDeployments(options?: RecentDeploymentsOptions): Promise<DeploymentSummary[]> {
+    const page = Math.max(1, options?.page ?? 1);
+    const perPage = Math.max(1, Math.min(options?.per_page ?? 20, 100));
+    const apps = (await this.listApplications({ summary: true })) as ApplicationSummary[];
+    const settled = await Promise.allSettled(
+      apps.map(async (app) => {
+        const deployments = await this.listApplicationDeployments(app.uuid);
+        return (deployments.deployments as DeploymentEssential[]).map((dep) => ({
+          uuid: dep.uuid,
+          deployment_uuid: dep.deployment_uuid,
+          application_name: dep.application_name || app.name,
+          status: dep.status,
+          created_at: dep.created_at,
+        }));
+      }),
+    );
+
+    const flattened = settled
+      .map((result) => (result.status === 'fulfilled' ? result.value : []))
+      .flatMap((value) => value)
+      .sort((a, b) => {
+        const aTime = Date.parse(a.created_at || '') || 0;
+        const bTime = Date.parse(b.created_at || '') || 0;
+        return bTime - aTime;
+      });
+
+    const start = (page - 1) * perPage;
+    return flattened.slice(start, start + perPage);
+  }
+
   async getDeployment(
     uuid: string,
     options?: { includeLogs?: boolean },
@@ -1301,6 +1425,71 @@ export class CoolifyClient {
         }
         return essential;
       }),
+    };
+  }
+
+  async waitForApplication(
+    uuid: string,
+    options?: WaitForApplicationOptions,
+  ): Promise<WaitForApplicationResult> {
+    const desiredStatuses = (
+      options?.desiredStatuses?.length ? options.desiredStatuses : ['running', 'healthy']
+    ).map((status) => status.toLowerCase());
+    const timeoutMs = Math.max(1000, options?.timeoutMs ?? 5 * 60 * 1000);
+    const pollIntervalMs = Math.max(1000, options?.pollIntervalMs ?? 5000);
+    const requireNoRunningDeployments = options?.requireNoRunningDeployments !== false;
+
+    const start = Date.now();
+    let pollCount = 0;
+    let applicationStatus: string | null = null;
+    let matchedStatus: string | null = null;
+    let activeDeployments = 0;
+    let lastDeployment: DeploymentEssential | null = null;
+
+    while (Date.now() - start <= timeoutMs) {
+      pollCount += 1;
+
+      const application = await this.getApplication(uuid);
+      applicationStatus = typeof application?.status === 'string' ? application.status : null;
+
+      const deploymentEnvelope = await this.listApplicationDeployments(uuid);
+      const deployments = Array.isArray(deploymentEnvelope.deployments)
+        ? (deploymentEnvelope.deployments as DeploymentEssential[])
+        : [];
+      activeDeployments = deployments.filter((deployment) => {
+        const status = String(deployment.status || '').toLowerCase();
+        return status === 'queued' || status === 'in_progress';
+      }).length;
+      lastDeployment = deployments[0] ?? null;
+
+      const normalizedStatus = String(applicationStatus || '').toLowerCase();
+      matchedStatus = desiredStatuses.find((status) => normalizedStatus.includes(status)) ?? null;
+
+      if (matchedStatus && (!requireNoRunningDeployments || activeDeployments === 0)) {
+        return {
+          outcome: 'ready',
+          uuid,
+          application_status: applicationStatus,
+          matched_status: matchedStatus,
+          active_deployments: activeDeployments,
+          poll_count: pollCount,
+          elapsed_ms: Date.now() - start,
+          last_deployment: lastDeployment,
+        };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+
+    return {
+      outcome: 'timeout',
+      uuid,
+      application_status: applicationStatus,
+      matched_status: matchedStatus,
+      active_deployments: activeDeployments,
+      poll_count: pollCount,
+      elapsed_ms: Date.now() - start,
+      last_deployment: lastDeployment,
     };
   }
 
