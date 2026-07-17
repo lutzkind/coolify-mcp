@@ -722,7 +722,7 @@ describe('CoolifyMcpServer v2', () => {
     it('previews without making any creation request', async () => {
       const createSpy = jest.spyOn(server['client'], 'createApplicationPublic');
 
-      const result = await callCreateApplication({ ...baseArgs, execute: false });
+      const result = await callCreateApplication(baseArgs);
       const body = JSON.parse(result.content[0]!.text);
 
       expect(createSpy).not.toHaveBeenCalled();
@@ -748,6 +748,64 @@ describe('CoolifyMcpServer v2', () => {
           is_auto_deploy_enabled: false,
         },
       });
+    });
+
+    it('previews an environment name and sends only that environment field', async () => {
+      const createSpy = jest.spyOn(server['client'], 'createApplicationPublic');
+
+      const result = await callCreateApplication({
+        ...baseArgs,
+        environment_uuid: undefined,
+        environment_name: ' production ',
+      });
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(body.payload).toEqual({
+        project_uuid: ids.project_uuid,
+        server_uuid: ids.server_uuid,
+        environment_name: 'production',
+        name: 'new-safe-app',
+        git_repository: 'https://github.com/example/repo.git',
+        git_branch: 'main',
+        build_pack: 'dockerfile',
+        dockerfile_location: 'apps/api/Dockerfile',
+        base_directory: '/apps/api',
+        ports_exposes: '3000',
+        domains: 'https://new-safe.example.com',
+        is_auto_deploy_enabled: false,
+      });
+      expect(body.payload).not.toHaveProperty('environment_uuid');
+    });
+
+    it('rejects requests with neither environment selector', async () => {
+      const result = await callCreateApplication({
+        ...baseArgs,
+        environment_uuid: undefined,
+        environment_name: undefined,
+      });
+
+      expect(result.content[0]!.text).toContain(
+        'exactly one of environment_uuid or environment_name is required',
+      );
+    });
+
+    it('rejects requests with both environment selectors', async () => {
+      const result = await callCreateApplication({ ...baseArgs, environment_name: 'production' });
+
+      expect(result.content[0]!.text).toContain(
+        'environment_uuid and environment_name are mutually exclusive',
+      );
+    });
+
+    it('rejects a blank environment name', async () => {
+      const result = await callCreateApplication({
+        ...baseArgs,
+        environment_uuid: undefined,
+        environment_name: '   ',
+      });
+
+      expect(result.content[0]!.text).toContain('environment_name must not be blank');
     });
 
     it('validates infrastructure, then sends the expected payload in execution mode', async () => {
@@ -795,6 +853,54 @@ describe('CoolifyMcpServer v2', () => {
       expect(body.created).toBe(true);
       expect(body.deployed).toBe(false);
       expect(body.application.uuid).toBe(ids.application_uuid);
+    });
+
+    it('validates infrastructure, then sends an environment name in execution mode', async () => {
+      jest.spyOn(server['client'], 'getServer').mockResolvedValue({
+        uuid: ids.server_uuid,
+        is_usable: true,
+      } as never);
+      jest.spyOn(server['client'], 'getProject').mockResolvedValue({
+        uuid: ids.project_uuid,
+      } as never);
+      jest
+        .spyOn(server['client'], 'listProjectEnvironments')
+        .mockResolvedValue([
+          { uuid: ids.environment_uuid, name: 'production', project_uuid: ids.project_uuid },
+        ] as never);
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([]);
+      const createSpy = jest
+        .spyOn(server['client'], 'createApplicationPublic')
+        .mockResolvedValue({ uuid: ids.application_uuid });
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: baseArgs.name,
+      } as never);
+
+      const result = await callCreateApplication({
+        ...baseArgs,
+        environment_uuid: undefined,
+        environment_name: ' production ',
+        execute: true,
+      });
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createSpy).toHaveBeenCalledWith({
+        project_uuid: ids.project_uuid,
+        server_uuid: ids.server_uuid,
+        environment_name: 'production',
+        name: 'new-safe-app',
+        git_repository: 'https://github.com/example/repo.git',
+        git_branch: 'main',
+        build_pack: 'dockerfile',
+        dockerfile_location: 'apps/api/Dockerfile',
+        base_directory: '/apps/api',
+        ports_exposes: '3000',
+        domains: 'https://new-safe.example.com',
+        is_auto_deploy_enabled: false,
+      });
+      expect(body.created).toBe(true);
+      expect(body.deployed).toBe(false);
     });
 
     it('fails closed on duplicate names before creation', async () => {

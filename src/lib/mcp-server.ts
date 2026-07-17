@@ -51,6 +51,7 @@ interface CreateApplicationToolArgs {
   server_uuid?: string;
   project_uuid?: string;
   environment_uuid?: string;
+  environment_name?: string;
   build_pack?: string;
   build_type?: string;
   dockerfile_location?: string;
@@ -98,11 +99,27 @@ function validateRepositoryPath(value: string, field: string): string | undefine
 
 export function validateCreateApplicationInput(args: CreateApplicationToolArgs): string[] {
   const errors: string[] = [];
-  for (const field of ['server_uuid', 'project_uuid', 'environment_uuid'] as const) {
+  for (const field of ['server_uuid', 'project_uuid'] as const) {
     const value = args[field]?.trim();
     if (!value) errors.push(`${field} is required`);
     else if (!isSafeCoolifyResourceId(value))
       errors.push(`${field} is not a valid Coolify resource identifier`);
+  }
+  const environmentUuid = args.environment_uuid?.trim();
+  const environmentName = args.environment_name?.trim();
+  if (args.environment_uuid !== undefined && !environmentUuid) {
+    errors.push('environment_uuid must not be blank');
+  }
+  if (args.environment_name !== undefined && !environmentName) {
+    errors.push('environment_name must not be blank');
+  }
+  if (!environmentUuid && !environmentName) {
+    errors.push('exactly one of environment_uuid or environment_name is required');
+  } else if (environmentUuid && environmentName) {
+    errors.push('environment_uuid and environment_name are mutually exclusive');
+  }
+  if (environmentUuid && !isSafeCoolifyResourceId(environmentUuid)) {
+    errors.push('environment_uuid is not a valid Coolify resource identifier');
   }
   for (const field of ['name', 'git_repository', 'git_branch'] as const) {
     if (!args[field]?.trim()) errors.push(`${field} is required`);
@@ -178,10 +195,14 @@ export function validateCreateApplicationInput(args: CreateApplicationToolArgs):
 
 function createApplicationPayload(args: CreateApplicationToolArgs): Record<string, unknown> {
   const buildPack = (args.build_pack ?? args.build_type)!.trim();
+  const environmentUuid = args.environment_uuid?.trim();
+  const environmentName = args.environment_name?.trim();
   return {
     project_uuid: args.project_uuid!.trim(),
     server_uuid: args.server_uuid!.trim(),
-    environment_uuid: args.environment_uuid!.trim(),
+    ...(environmentUuid
+      ? { environment_uuid: environmentUuid }
+      : { environment_name: environmentName }),
     name: args.name!.trim(),
     git_repository: args.git_repository!.trim(),
     git_branch: args.git_branch!.trim(),
@@ -1001,7 +1022,8 @@ export class CoolifyMcpServer extends McpServer {
         git_branch: z.string(),
         server_uuid: z.string(),
         project_uuid: z.string(),
-        environment_uuid: z.string(),
+        environment_uuid: z.string().optional(),
+        environment_name: z.string().optional(),
         build_pack: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
         build_type: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
         dockerfile_location: z.string().optional(),
@@ -1072,17 +1094,29 @@ export class CoolifyMcpServer extends McpServer {
           if (!Array.isArray(environments)) {
             throw new Error('Coolify returned a malformed environment response');
           }
-          const environment = environments.find(
-            (item) => isRecord(item) && item.uuid === args.environment_uuid!.trim(),
-          );
+          const environmentUuid = args.environment_uuid?.trim();
+          const environmentName = args.environment_name?.trim();
+          const environment = environments.find((item) => {
+            if (!isRecord(item)) return false;
+            if (environmentUuid) return item.uuid === environmentUuid;
+            return item.name === environmentName;
+          });
           if (!environment) {
-            throw new Error('environment_uuid was not found in the requested project');
+            throw new Error(
+              environmentUuid
+                ? 'environment_uuid was not found in the requested project'
+                : 'environment_name was not found in the requested project',
+            );
           }
           if (
             typeof environment.project_uuid === 'string' &&
             environment.project_uuid !== args.project_uuid!.trim()
           ) {
-            throw new Error('environment_uuid does not belong to project_uuid');
+            throw new Error(
+              environmentUuid
+                ? 'environment_uuid does not belong to project_uuid'
+                : 'environment_name does not belong to project_uuid',
+            );
           }
 
           const applications = await this.client.listApplications();
