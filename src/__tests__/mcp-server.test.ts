@@ -778,6 +778,28 @@ describe('CoolifyMcpServer v2', () => {
       expect(body.payload).not.toHaveProperty('environment_uuid');
     });
 
+    it('previews a trimmed destination UUID without making a POST', async () => {
+      const createSpy = jest.spyOn(server['client'], 'createApplicationPublic');
+
+      const result = await callCreateApplication({
+        ...baseArgs,
+        destination_uuid: ' gkw804owwskcksw0s8oww4sg ',
+      });
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(body.payload.destination_uuid).toBe('gkw804owwskcksw0s8oww4sg');
+      expect(body.created).toBe(false);
+      expect(body.deployed).toBe(false);
+    });
+
+    it('supports omitting destination_uuid without inferring one', async () => {
+      const result = await callCreateApplication(baseArgs);
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(body.payload).not.toHaveProperty('destination_uuid');
+    });
+
     it('rejects requests with neither environment selector', async () => {
       const result = await callCreateApplication({
         ...baseArgs,
@@ -808,6 +830,23 @@ describe('CoolifyMcpServer v2', () => {
       expect(result.content[0]!.text).toContain('environment_name must not be blank');
     });
 
+    it('rejects a blank destination UUID', async () => {
+      const result = await callCreateApplication({ ...baseArgs, destination_uuid: '   ' });
+
+      expect(result.content[0]!.text).toContain('destination_uuid must not be blank');
+    });
+
+    it('rejects a malformed destination UUID', async () => {
+      const result = await callCreateApplication({
+        ...baseArgs,
+        destination_uuid: 'not-a-coolify-id',
+      });
+
+      expect(result.content[0]!.text).toContain(
+        'destination_uuid is not a valid Coolify resource identifier',
+      );
+    });
+
     it('validates infrastructure, then sends the expected payload in execution mode', async () => {
       jest.spyOn(server['client'], 'getServer').mockResolvedValue({
         uuid: ids.server_uuid,
@@ -833,13 +872,18 @@ describe('CoolifyMcpServer v2', () => {
         build_pack: baseArgs.build_pack,
       } as never);
 
-      const result = await callCreateApplication({ ...baseArgs, execute: true });
+      const result = await callCreateApplication({
+        ...baseArgs,
+        destination_uuid: ' gkw804owwskcksw0s8oww4sg ',
+        execute: true,
+      });
       const body = JSON.parse(result.content[0]!.text);
 
       expect(createSpy).toHaveBeenCalledWith({
         project_uuid: ids.project_uuid,
         server_uuid: ids.server_uuid,
         environment_uuid: ids.environment_uuid,
+        destination_uuid: 'gkw804owwskcksw0s8oww4sg',
         name: 'new-safe-app',
         git_repository: 'https://github.com/example/repo.git',
         git_branch: 'main',

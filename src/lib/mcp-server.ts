@@ -52,6 +52,7 @@ interface CreateApplicationToolArgs {
   project_uuid?: string;
   environment_uuid?: string;
   environment_name?: string;
+  destination_uuid?: string;
   build_pack?: string;
   build_type?: string;
   dockerfile_location?: string;
@@ -107,6 +108,7 @@ export function validateCreateApplicationInput(args: CreateApplicationToolArgs):
   }
   const environmentUuid = args.environment_uuid?.trim();
   const environmentName = args.environment_name?.trim();
+  const destinationUuid = args.destination_uuid?.trim();
   if (args.environment_uuid !== undefined && !environmentUuid) {
     errors.push('environment_uuid must not be blank');
   }
@@ -120,6 +122,12 @@ export function validateCreateApplicationInput(args: CreateApplicationToolArgs):
   }
   if (environmentUuid && !isSafeCoolifyResourceId(environmentUuid)) {
     errors.push('environment_uuid is not a valid Coolify resource identifier');
+  }
+  if (args.destination_uuid !== undefined && !destinationUuid) {
+    errors.push('destination_uuid must not be blank');
+  }
+  if (destinationUuid && !isSafeCoolifyResourceId(destinationUuid)) {
+    errors.push('destination_uuid is not a valid Coolify resource identifier');
   }
   for (const field of ['name', 'git_repository', 'git_branch'] as const) {
     if (!args[field]?.trim()) errors.push(`${field} is required`);
@@ -197,12 +205,14 @@ function createApplicationPayload(args: CreateApplicationToolArgs): Record<strin
   const buildPack = (args.build_pack ?? args.build_type)!.trim();
   const environmentUuid = args.environment_uuid?.trim();
   const environmentName = args.environment_name?.trim();
+  const destinationUuid = args.destination_uuid?.trim();
   return {
     project_uuid: args.project_uuid!.trim(),
     server_uuid: args.server_uuid!.trim(),
     ...(environmentUuid
       ? { environment_uuid: environmentUuid }
       : { environment_name: environmentName }),
+    ...(destinationUuid ? { destination_uuid: destinationUuid } : {}),
     name: args.name!.trim(),
     git_repository: args.git_repository!.trim(),
     git_branch: args.git_branch!.trim(),
@@ -1024,6 +1034,7 @@ export class CoolifyMcpServer extends McpServer {
         project_uuid: z.string(),
         environment_uuid: z.string().optional(),
         environment_name: z.string().optional(),
+        destination_uuid: z.string().optional(),
         build_pack: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
         build_type: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
         dockerfile_location: z.string().optional(),
