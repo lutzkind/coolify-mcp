@@ -683,6 +683,213 @@ describe('CoolifyMcpServer v2', () => {
     });
   });
 
+  describe('create_application tool handler', () => {
+    const ids = {
+      server_uuid: 'abcdefghijklmnopqrstuvwx',
+      project_uuid: 'bcdefghijklmnopqrstuvwxy',
+      environment_uuid: 'cdefghijklmnopqrstuvwxyz',
+      application_uuid: 'defghijklmnopqrstuvwxyza',
+    };
+    const baseArgs = {
+      name: 'new-safe-app',
+      git_repository: 'https://github.com/example/repo.git',
+      git_branch: 'main',
+      server_uuid: ids.server_uuid,
+      project_uuid: ids.project_uuid,
+      environment_uuid: ids.environment_uuid,
+      build_pack: 'dockerfile',
+      dockerfile_location: 'apps/api/Dockerfile',
+      base_directory: '/apps/api',
+      ports_exposes: '3000',
+      domain: 'https://new-safe.example.com',
+      auto_deploy: false,
+    };
+
+    const callCreateApplication = async (
+      args: Record<string, unknown>,
+    ): Promise<{ content: Array<{ text: string }> }> => {
+      const tool = (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools['create_application'];
+      return (await tool.handler(args, {})) as { content: Array<{ text: string }> };
+    };
+
+    it('previews without making any creation request', async () => {
+      const createSpy = jest.spyOn(server['client'], 'createApplicationPublic');
+
+      const result = await callCreateApplication({ ...baseArgs, execute: false });
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(body).toEqual({
+        mode: 'preview',
+        execute: false,
+        created: false,
+        deployed: false,
+        message: 'Preview only: no Coolify application was created.',
+        endpoint: '/api/v1/applications/public',
+        payload: {
+          project_uuid: ids.project_uuid,
+          server_uuid: ids.server_uuid,
+          environment_uuid: ids.environment_uuid,
+          name: 'new-safe-app',
+          git_repository: 'https://github.com/example/repo.git',
+          git_branch: 'main',
+          build_pack: 'dockerfile',
+          dockerfile_location: 'apps/api/Dockerfile',
+          base_directory: '/apps/api',
+          ports_exposes: '3000',
+          domains: 'https://new-safe.example.com',
+          is_auto_deploy_enabled: false,
+        },
+      });
+    });
+
+    it('validates infrastructure, then sends the expected payload in execution mode', async () => {
+      jest.spyOn(server['client'], 'getServer').mockResolvedValue({
+        uuid: ids.server_uuid,
+        is_usable: true,
+      } as never);
+      jest.spyOn(server['client'], 'getProject').mockResolvedValue({
+        uuid: ids.project_uuid,
+      } as never);
+      jest
+        .spyOn(server['client'], 'listProjectEnvironments')
+        .mockResolvedValue([
+          { uuid: ids.environment_uuid, project_uuid: ids.project_uuid },
+        ] as never);
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([]);
+      const createSpy = jest
+        .spyOn(server['client'], 'createApplicationPublic')
+        .mockResolvedValue({ uuid: ids.application_uuid });
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: baseArgs.name,
+        git_repository: baseArgs.git_repository,
+        git_branch: baseArgs.git_branch,
+        build_pack: baseArgs.build_pack,
+      } as never);
+
+      const result = await callCreateApplication({ ...baseArgs, execute: true });
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createSpy).toHaveBeenCalledWith({
+        project_uuid: ids.project_uuid,
+        server_uuid: ids.server_uuid,
+        environment_uuid: ids.environment_uuid,
+        name: 'new-safe-app',
+        git_repository: 'https://github.com/example/repo.git',
+        git_branch: 'main',
+        build_pack: 'dockerfile',
+        dockerfile_location: 'apps/api/Dockerfile',
+        base_directory: '/apps/api',
+        ports_exposes: '3000',
+        domains: 'https://new-safe.example.com',
+        is_auto_deploy_enabled: false,
+      });
+      expect(body.created).toBe(true);
+      expect(body.deployed).toBe(false);
+      expect(body.application.uuid).toBe(ids.application_uuid);
+    });
+
+    it('fails closed on duplicate names before creation', async () => {
+      jest.spyOn(server['client'], 'getServer').mockResolvedValue({
+        uuid: ids.server_uuid,
+        is_usable: true,
+      } as never);
+      jest
+        .spyOn(server['client'], 'getProject')
+        .mockResolvedValue({ uuid: ids.project_uuid } as never);
+      jest
+        .spyOn(server['client'], 'listProjectEnvironments')
+        .mockResolvedValue([
+          { uuid: ids.environment_uuid, project_uuid: ids.project_uuid },
+        ] as never);
+      jest
+        .spyOn(server['client'], 'listApplications')
+        .mockResolvedValue([{ uuid: ids.application_uuid, name: 'NEW-SAFE-APP' }] as never);
+      const createSpy = jest.spyOn(server['client'], 'createApplicationPublic');
+
+      const result = await callCreateApplication({ ...baseArgs, execute: true });
+
+      expect(result.content[0]!.text).toContain('same name already exists');
+      expect(createSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects missing or invalid infrastructure identifiers without network calls', async () => {
+      const getServerSpy = jest.spyOn(server['client'], 'getServer');
+      const result = await callCreateApplication({
+        ...baseArgs,
+        server_uuid: 'not-a-coolify-id',
+        project_uuid: '',
+        execute: true,
+      });
+
+      expect(result.content[0]!.text).toContain(
+        'server_uuid is not a valid Coolify resource identifier',
+      );
+      expect(result.content[0]!.text).toContain('project_uuid is required');
+      expect(getServerSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects Dockerfile traversal before preview or execution', async () => {
+      const result = await callCreateApplication({
+        ...baseArgs,
+        dockerfile_location: '../secrets/Dockerfile',
+        execute: false,
+      });
+
+      expect(result.content[0]!.text).toContain(
+        'dockerfile_location must be a repository-relative path',
+      );
+      expect(result.content[0]!.text).not.toContain('secrets/Dockerfile');
+    });
+
+    it('rejects malformed Coolify creation responses safely', async () => {
+      jest
+        .spyOn(server['client'], 'getServer')
+        .mockResolvedValue({ uuid: ids.server_uuid } as never);
+      jest
+        .spyOn(server['client'], 'getProject')
+        .mockResolvedValue({ uuid: ids.project_uuid } as never);
+      jest
+        .spyOn(server['client'], 'listProjectEnvironments')
+        .mockResolvedValue([
+          { uuid: ids.environment_uuid, project_uuid: ids.project_uuid },
+        ] as never);
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([]);
+      jest.spyOn(server['client'], 'createApplicationPublic').mockResolvedValue({} as never);
+
+      const result = await callCreateApplication({ ...baseArgs, execute: true });
+
+      expect(result.content[0]!.text).toContain('malformed creation metadata');
+      expect(result.content[0]!.text).not.toContain('test-token');
+    });
+
+    it('redacts secrets from execution errors', async () => {
+      jest
+        .spyOn(server['client'], 'getServer')
+        .mockRejectedValue(new Error('Coolify rejected request with token=test-token'));
+
+      const result = await callCreateApplication({ ...baseArgs, execute: true });
+
+      expect(result.content[0]!.text).not.toContain('test-token');
+      expect(result.content[0]!.text).toContain('***REDACTED***');
+    });
+
+    it('keeps the existing application tool registered', () => {
+      const tools = (server as unknown as { _registeredTools: Record<string, unknown> })
+        ._registeredTools;
+      expect(tools['application']).toBeDefined();
+      expect(tools['create_application']).toBeDefined();
+    });
+  });
+
   describe('database tool handler', () => {
     // Regression for #217 — the database tool's create action didn't expose
     // destination_uuid, so Coolify rejected creates on servers with more than

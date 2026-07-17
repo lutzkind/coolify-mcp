@@ -33,6 +33,173 @@ import { DocsSearchEngine } from './docs-search.js';
 const _require = createRequire(import.meta.url);
 export const VERSION: string = _require('../../package.json').version;
 
+const CREATE_APPLICATION_ENDPOINT = '/api/v1/applications/public';
+const COOLIFY_RESOURCE_ID =
+  /^(?:[a-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+const CREATE_APPLICATION_BUILD_PACKS = [
+  'nixpacks',
+  'railpack',
+  'static',
+  'dockerfile',
+  'dockercompose',
+] as const;
+
+interface CreateApplicationToolArgs {
+  name?: string;
+  git_repository?: string;
+  git_branch?: string;
+  server_uuid?: string;
+  project_uuid?: string;
+  environment_uuid?: string;
+  build_pack?: string;
+  build_type?: string;
+  dockerfile_location?: string;
+  base_directory?: string;
+  ports_exposes?: string;
+  domain?: string;
+  auto_deploy?: boolean;
+  execute?: boolean;
+}
+
+function isSafeCoolifyResourceId(value: string): boolean {
+  return COOLIFY_RESOURCE_ID.test(value.trim());
+}
+
+function hasControlCharacter(value: string): boolean {
+  return Array.from(value).some((character) => character.charCodeAt(0) < 32);
+}
+
+function validateRepository(value: string): string | undefined {
+  if (/\s/.test(value) || hasControlCharacter(value))
+    return 'git_repository must not contain whitespace or control characters';
+  if (/^(?:https?|ssh):\/\//i.test(value)) {
+    try {
+      const url = new URL(value);
+      if (url.username || url.password || /(?:token|secret|password|key)=/i.test(url.search)) {
+        return 'git_repository must not contain credentials or secret query parameters';
+      }
+      if (!url.hostname) return 'git_repository must contain a repository host';
+      return undefined;
+    } catch {
+      return 'git_repository must be a valid repository URL';
+    }
+  }
+  if (/^git@[^:]+:[^\s]+$/i.test(value)) return undefined;
+  return 'git_repository must be an HTTPS, SSH URL, or git@host:path repository';
+}
+
+function validateRepositoryPath(value: string, field: string): string | undefined {
+  if (value.includes('\u0000') || value.includes('\\') || /(^|\/)\.\.(?:\/|$)/.test(value)) {
+    return `${field} must be a repository-relative path without traversal`;
+  }
+  if (value.trim() === '') return `${field} must not be empty`;
+  return undefined;
+}
+
+export function validateCreateApplicationInput(args: CreateApplicationToolArgs): string[] {
+  const errors: string[] = [];
+  for (const field of ['server_uuid', 'project_uuid', 'environment_uuid'] as const) {
+    const value = args[field]?.trim();
+    if (!value) errors.push(`${field} is required`);
+    else if (!isSafeCoolifyResourceId(value))
+      errors.push(`${field} is not a valid Coolify resource identifier`);
+  }
+  for (const field of ['name', 'git_repository', 'git_branch'] as const) {
+    if (!args[field]?.trim()) errors.push(`${field} is required`);
+  }
+  if (args.name && args.name.trim().length > 255)
+    errors.push('name must be 255 characters or fewer');
+  if (args.git_repository?.trim()) {
+    const error = validateRepository(args.git_repository.trim());
+    if (error) errors.push(error);
+  }
+  if (args.git_branch && (/\s/.test(args.git_branch) || hasControlCharacter(args.git_branch))) {
+    errors.push('git_branch must not contain whitespace or control characters');
+  }
+
+  const buildPack = args.build_pack?.trim();
+  const buildType = args.build_type?.trim();
+  if (!buildPack && !buildType) errors.push('build_pack or build_type is required');
+  if (
+    buildPack &&
+    !CREATE_APPLICATION_BUILD_PACKS.includes(
+      buildPack as (typeof CREATE_APPLICATION_BUILD_PACKS)[number],
+    )
+  ) {
+    errors.push(`unsupported build configuration: ${buildPack}`);
+  }
+  if (
+    buildType &&
+    !CREATE_APPLICATION_BUILD_PACKS.includes(
+      buildType as (typeof CREATE_APPLICATION_BUILD_PACKS)[number],
+    )
+  ) {
+    errors.push(`unsupported build configuration: ${buildType}`);
+  }
+  if (buildPack && buildType && buildPack !== buildType) {
+    errors.push('build_pack and build_type must match when both are supplied');
+  }
+  if (args.dockerfile_location) {
+    const error = validateRepositoryPath(args.dockerfile_location, 'dockerfile_location');
+    if (error) errors.push(error);
+    if ((buildPack ?? buildType) !== 'dockerfile') {
+      errors.push('dockerfile_location is only supported with the dockerfile build pack');
+    }
+  }
+  if (args.base_directory) {
+    const error = validateRepositoryPath(args.base_directory, 'base_directory');
+    if (error) errors.push(error);
+  }
+  if (args.ports_exposes !== undefined) {
+    const ports = args.ports_exposes.split(',').map((port) => port.trim());
+    if (
+      ports.length === 0 ||
+      ports.some((port) => !/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535)
+    ) {
+      errors.push('ports_exposes must be a comma-separated list of ports from 1 to 65535');
+    }
+  }
+  if (args.domain) {
+    for (const domain of args.domain.split(',').map((item) => item.trim())) {
+      try {
+        const url = new URL(domain.includes('://') ? domain : `https://${domain}`);
+        if (!url.hostname || url.username || url.password || /\s/.test(domain)) {
+          errors.push('domain must be a hostname or URL without credentials');
+          break;
+        }
+      } catch {
+        errors.push('domain must be a valid hostname or URL');
+        break;
+      }
+    }
+  }
+  return errors;
+}
+
+function createApplicationPayload(args: CreateApplicationToolArgs): Record<string, unknown> {
+  const buildPack = (args.build_pack ?? args.build_type)!.trim();
+  return {
+    project_uuid: args.project_uuid!.trim(),
+    server_uuid: args.server_uuid!.trim(),
+    environment_uuid: args.environment_uuid!.trim(),
+    name: args.name!.trim(),
+    git_repository: args.git_repository!.trim(),
+    git_branch: args.git_branch!.trim(),
+    build_pack: buildPack,
+    ...(args.dockerfile_location !== undefined
+      ? { dockerfile_location: args.dockerfile_location.trim() }
+      : {}),
+    ...(args.base_directory !== undefined ? { base_directory: args.base_directory.trim() } : {}),
+    ...(args.ports_exposes !== undefined ? { ports_exposes: args.ports_exposes.trim() } : {}),
+    ...(args.domain !== undefined ? { domains: args.domain.trim() } : {}),
+    ...(args.auto_deploy !== undefined ? { is_auto_deploy_enabled: args.auto_deploy } : {}),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /** Wrap handler with error handling */
 function wrap<T>(
   fn: () => Promise<T>,
@@ -292,8 +459,8 @@ export function filterLogText(
     max_chars?: number;
   } = {},
 ): { logs: string; matched_lines: number; truncated: boolean; total_lines: number } {
-  // eslint-disable-next-line no-control-regex
   const ansi =
+    // eslint-disable-next-line no-control-regex
     /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
   const source = options.remove_ansi === false ? String(raw) : String(raw).replace(ansi, '');
   const lines = source.split('\n');
@@ -823,6 +990,167 @@ export class CoolifyMcpServer extends McpServer {
               String((app as Record<string, unknown>).status || ''),
             ),
         ),
+    );
+
+    this.tool(
+      'create_application',
+      'Safely create a Git-backed Coolify application. Preview by default; execute=true is required to create and never deploys.',
+      {
+        name: z.string(),
+        git_repository: z.string(),
+        git_branch: z.string(),
+        server_uuid: z.string(),
+        project_uuid: z.string(),
+        environment_uuid: z.string(),
+        build_pack: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
+        build_type: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
+        dockerfile_location: z.string().optional(),
+        base_directory: z.string().optional(),
+        ports_exposes: z.string().optional(),
+        domain: z.string().optional(),
+        auto_deploy: z.boolean().optional(),
+        execute: z.boolean().default(false),
+      },
+      async (rawArgs) => {
+        const args = rawArgs as CreateApplicationToolArgs;
+        const validationErrors = validateCreateApplicationInput(args);
+        if (args.execute === true && args.ports_exposes === undefined) {
+          validationErrors.push(
+            'ports_exposes is required by Coolify POST /applications/public when execute=true',
+          );
+        }
+        if (validationErrors.length > 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: create_application refused: ${validationErrors.join('; ')}`,
+              },
+            ],
+          };
+        }
+
+        const payload = createApplicationPayload(args);
+        if (args.execute !== true) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    mode: 'preview',
+                    execute: false,
+                    created: false,
+                    deployed: false,
+                    message: 'Preview only: no Coolify application was created.',
+                    endpoint: CREATE_APPLICATION_ENDPOINT,
+                    payload,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        try {
+          const [server, project, environments] = await Promise.all([
+            this.client.getServer(args.server_uuid!.trim()),
+            this.client.getProject(args.project_uuid!.trim()),
+            this.client.listProjectEnvironments(args.project_uuid!.trim()),
+          ]);
+          if (!isRecord(server) || server.uuid !== args.server_uuid!.trim()) {
+            throw new Error('server_uuid could not be verified against Coolify');
+          }
+          if (server.is_usable === false || server.is_reachable === false) {
+            throw new Error('server_uuid identifies a server that is not usable');
+          }
+          if (!isRecord(project) || project.uuid !== args.project_uuid!.trim()) {
+            throw new Error('project_uuid could not be verified against Coolify');
+          }
+          if (!Array.isArray(environments)) {
+            throw new Error('Coolify returned a malformed environment response');
+          }
+          const environment = environments.find(
+            (item) => isRecord(item) && item.uuid === args.environment_uuid!.trim(),
+          );
+          if (!environment) {
+            throw new Error('environment_uuid was not found in the requested project');
+          }
+          if (
+            typeof environment.project_uuid === 'string' &&
+            environment.project_uuid !== args.project_uuid!.trim()
+          ) {
+            throw new Error('environment_uuid does not belong to project_uuid');
+          }
+
+          const applications = await this.client.listApplications();
+          if (!Array.isArray(applications)) {
+            throw new Error('Coolify returned a malformed application list');
+          }
+          const requestedName = args.name!.trim().toLocaleLowerCase();
+          const duplicate = applications.find(
+            (application) =>
+              isRecord(application) &&
+              typeof application.name === 'string' &&
+              application.name.trim().toLocaleLowerCase() === requestedName,
+          );
+          if (duplicate) {
+            throw new Error(
+              'an application with the same name already exists; refusing to modify it',
+            );
+          }
+
+          const created = await this.client.createApplicationPublic(payload as any);
+          if (
+            !isRecord(created) ||
+            typeof created.uuid !== 'string' ||
+            !isSafeCoolifyResourceId(created.uuid)
+          ) {
+            throw new Error('Coolify returned malformed creation metadata; refusing to continue');
+          }
+          const application = await this.client.getApplication(created.uuid);
+          if (!isRecord(application) || application.uuid !== created.uuid) {
+            throw new Error(
+              `Coolify created ${created.uuid}, but returned malformed application metadata`,
+            );
+          }
+          const summarized = summarizeApplicationForRead(application);
+          const safeApplication = JSON.parse(
+            this.client.sanitizeError(JSON.stringify(summarized)),
+          ) as Record<string, unknown>;
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    mode: 'execute',
+                    execute: true,
+                    created: true,
+                    deployed: false,
+                    message: 'Application created. No deployment was requested or started.',
+                    endpoint: CREATE_APPLICATION_ENDPOINT,
+                    application: safeApplication,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: create_application refused or failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
     );
 
     this.tool(

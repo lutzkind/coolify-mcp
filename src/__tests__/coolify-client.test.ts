@@ -1239,6 +1239,46 @@ describe('CoolifyClient', () => {
       expect(callBody.fqdn).toBeUndefined();
     });
 
+    it('should send the current public application creation payload to the exact endpoint', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse({ uuid: 'new-app-uuid' }, true, 201));
+
+      await client.createApplicationPublic({
+        project_uuid: 'proj-uuid',
+        server_uuid: 'server-uuid',
+        environment_uuid: 'env-uuid',
+        name: 'safe-app',
+        git_repository: 'https://github.com/user/repo.git',
+        git_branch: 'main',
+        build_pack: 'dockerfile',
+        dockerfile_location: 'apps/api/Dockerfile',
+        base_directory: '/apps/api',
+        ports_exposes: '3000',
+        domains: 'https://app.example.com',
+        is_auto_deploy_enabled: false,
+      });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:3000/api/v1/applications/public',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            project_uuid: 'proj-uuid',
+            server_uuid: 'server-uuid',
+            environment_uuid: 'env-uuid',
+            name: 'safe-app',
+            git_repository: 'https://github.com/user/repo.git',
+            git_branch: 'main',
+            build_pack: 'dockerfile',
+            dockerfile_location: 'apps/api/Dockerfile',
+            base_directory: '/apps/api',
+            ports_exposes: '3000',
+            domains: 'https://app.example.com',
+            is_auto_deploy_enabled: false,
+          }),
+        }),
+      );
+    });
+
     it('should map fqdn to domains in createApplicationPrivateGH', async () => {
       mockFetch.mockResolvedValueOnce(mockResponse({ uuid: 'new-app-uuid' }));
 

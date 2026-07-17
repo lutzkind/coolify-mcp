@@ -186,7 +186,13 @@ export interface CreateEnvironmentRequest {
 // Application Types
 // =============================================================================
 
-export type BuildPack = 'nixpacks' | 'static' | 'dockerfile' | 'dockercompose' | 'dockerimage';
+export type BuildPack =
+  | 'nixpacks'
+  | 'railpack'
+  | 'static'
+  | 'dockerfile'
+  | 'dockercompose'
+  | 'dockerimage';
 
 export interface Application {
   id: number;
@@ -270,6 +276,7 @@ export interface CreateApplicationPublicRequest {
   start_command?: string;
   dockerfile_location?: string;
   watch_paths?: string;
+  is_auto_deploy_enabled?: boolean;
   // Health check configuration
   health_check_enabled?: boolean;
   health_check_path?: string;
@@ -498,7 +505,14 @@ export interface EnvVarSummary {
 // =============================================================================
 
 export type DatabaseType =
-  'postgresql' | 'mysql' | 'mariadb' | 'mongodb' | 'redis' | 'keydb' | 'clickhouse' | 'dragonfly';
+  | 'postgresql'
+  | 'mysql'
+  | 'mariadb'
+  | 'mongodb'
+  | 'redis'
+  | 'keydb'
+  | 'clickhouse'
+  | 'dragonfly';
 
 export interface DatabaseLimits {
   memory?: string;

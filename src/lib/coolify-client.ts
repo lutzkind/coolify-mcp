@@ -451,8 +451,16 @@ const SENSITIVE_TEXT_REPLACEMENTS: Array<{ pattern: RegExp; replacement: string 
   },
 ];
 
-export function redactSensitiveText(text: string): string {
+export function redactSensitiveText(
+  text: string,
+  additionalSecrets: readonly string[] = [],
+): string {
   let redacted = text;
+  for (const secret of additionalSecrets) {
+    if (secret.length > 0) {
+      redacted = redacted.split(secret).join('***REDACTED***');
+    }
+  }
   for (const { pattern, replacement } of SENSITIVE_TEXT_REPLACEMENTS) {
     redacted = redacted.replace(pattern, replacement);
   }
@@ -624,6 +632,12 @@ export class CoolifyClient {
     this.customHeaders = filtered;
   }
 
+  /** Redact API credentials from errors before they cross the MCP boundary. */
+  sanitizeError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    return redactSensitiveText(message, [this.accessToken]);
+  }
+
   // ===========================================================================
   // Private HTTP methods
   // ===========================================================================
@@ -631,9 +645,13 @@ export class CoolifyClient {
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const url = `${this.baseUrl}/api/v1${path}`;
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+
     try {
       const response = await fetch(url, {
         ...options,
+        signal: options.signal ?? controller.signal,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${this.accessToken}`,
@@ -677,11 +695,19 @@ export class CoolifyClient {
         if (hint) {
           errorMessage = `${errorMessage} (${hint})`;
         }
-        throw new Error(errorMessage);
+        throw new Error(redactSensitiveText(errorMessage, [this.accessToken]));
       }
 
       return data as T;
     } catch (error) {
+      if (
+        (typeof DOMException !== 'undefined' &&
+          error instanceof DOMException &&
+          error.name === 'AbortError') ||
+        (error instanceof Error && error.name === 'AbortError')
+      ) {
+        throw new Error(`Coolify request timed out after 30 seconds: ${path}`, { cause: error });
+      }
       if (error instanceof TypeError && error.message.includes('fetch')) {
         throw new Error(
           `Failed to connect to Coolify server at ${this.baseUrl}. Please check if the server is running and accessible.`,
@@ -689,6 +715,8 @@ export class CoolifyClient {
         );
       }
       throw error;
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
