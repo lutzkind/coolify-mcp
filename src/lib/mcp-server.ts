@@ -24,6 +24,7 @@ import type {
   CoolifyConfig,
   GitHubApp,
   BuildPack,
+  Database,
   ResponseAction,
   ResponsePagination,
   Deployment,
@@ -229,6 +230,187 @@ function createApplicationPayload(args: CreateApplicationToolArgs): Record<strin
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+const PROVISION_POSTGRES_DATA_MOUNT = '/var/lib/postgresql/data';
+const PROVISION_POSTGRES_DEFAULT_VERSION = '16';
+const PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE = '10Gi';
+const PROVISION_POSTGRES_READY_TIMEOUT_MS = 30_000;
+const PROVISION_POSTGRES_POLL_INTERVAL_MS = 1_000;
+
+export interface ProvisionApplicationPostgresToolArgs {
+  application_uuid?: string;
+  project_uuid?: string;
+  environment_uuid?: string;
+  environment_name?: string;
+  server_uuid?: string;
+  destination_uuid?: string;
+  database_name?: string;
+  environment_variable_key?: string;
+  postgres_version?: string;
+  storage_size?: string;
+  dry_run?: boolean;
+  apply?: boolean;
+  redeploy_application?: boolean;
+}
+
+export function validateProvisionApplicationPostgresInput(
+  args: ProvisionApplicationPostgresToolArgs,
+): string[] {
+  const errors: string[] = [];
+  for (const field of [
+    'application_uuid',
+    'project_uuid',
+    'server_uuid',
+    'destination_uuid',
+  ] as const) {
+    const value = args[field]?.trim();
+    if (!value) errors.push(`${field} is required`);
+    else if (!isSafeCoolifyResourceId(value)) {
+      errors.push(`${field} is not a valid Coolify resource identifier`);
+    }
+  }
+
+  const environmentUuid = args.environment_uuid?.trim();
+  const environmentName = args.environment_name?.trim();
+  if (args.environment_uuid !== undefined && !environmentUuid) {
+    errors.push('environment_uuid must not be blank');
+  }
+  if (args.environment_name !== undefined && !environmentName) {
+    errors.push('environment_name must not be blank');
+  }
+  if (!environmentUuid && !environmentName) {
+    errors.push('exactly one of environment_uuid or environment_name is required');
+  } else if (environmentUuid && environmentName) {
+    errors.push('environment_uuid and environment_name are mutually exclusive');
+  }
+  if (environmentUuid && !isSafeCoolifyResourceId(environmentUuid)) {
+    errors.push('environment_uuid is not a valid Coolify resource identifier');
+  }
+
+  const databaseName = args.database_name?.trim();
+  if (!databaseName) errors.push('database_name is required');
+  else if (!/^[a-z][a-z0-9_]{0,62}$/.test(databaseName)) {
+    errors.push(
+      'database_name must start with a lowercase letter and contain only lowercase letters, numbers, and underscores',
+    );
+  }
+
+  const variableKey = args.environment_variable_key?.trim();
+  if (!variableKey) errors.push('environment_variable_key is required');
+  else if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(variableKey)) {
+    errors.push('environment_variable_key must be a valid environment-variable key');
+  }
+
+  const postgresVersion = args.postgres_version?.trim() || PROVISION_POSTGRES_DEFAULT_VERSION;
+  if (!/^\d+(?:\.\d+)?$/.test(postgresVersion)) {
+    errors.push('postgres_version must contain only a PostgreSQL version number');
+  }
+
+  const storageSize = args.storage_size?.trim() || PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE;
+  if (!/^\d+(?:Mi|Gi|Ti)$/.test(storageSize)) {
+    errors.push('storage_size must use a positive value with Mi, Gi, or Ti');
+  }
+
+  const dryRun = args.dry_run ?? true;
+  const apply = args.apply ?? false;
+  if (dryRun && apply) errors.push('dry_run and apply cannot both be true');
+  if (!dryRun && !apply) errors.push('apply=true is required when dry_run=false');
+  if (args.redeploy_application === true && !apply) {
+    errors.push('redeploy_application requires apply=true');
+  }
+  return errors;
+}
+
+function stringProperty(value: unknown, key: string): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const result = value[key];
+  return typeof result === 'string' ? result : undefined;
+}
+
+function nestedRecord(value: unknown, key: string): Record<string, unknown> | undefined {
+  if (!isRecord(value) || !isRecord(value[key])) return undefined;
+  return value[key] as Record<string, unknown>;
+}
+
+function destinationUuidOf(resource: unknown): string | undefined {
+  const direct = stringProperty(resource, 'destination_uuid');
+  const nested = stringProperty(nestedRecord(resource, 'destination'), 'uuid');
+  return direct ?? nested;
+}
+
+function destinationServerUuidOf(resource: unknown): string | undefined {
+  const destination = nestedRecord(resource, 'destination');
+  return (
+    stringProperty(destination, 'server_uuid') ??
+    stringProperty(nestedRecord(destination, 'server'), 'uuid') ??
+    stringProperty(resource, 'server_uuid')
+  );
+}
+
+function environmentIdOf(resource: unknown): number | undefined {
+  if (!isRecord(resource) || typeof resource.environment_id !== 'number') return undefined;
+  return resource.environment_id;
+}
+
+function databaseTypeOf(database: unknown): string {
+  return (
+    stringProperty(database, 'type') ??
+    stringProperty(database, 'database_type') ??
+    ''
+  ).toLowerCase();
+}
+
+function databaseIsReady(database: unknown): boolean {
+  const status = stringProperty(database, 'status')?.toLowerCase() ?? '';
+  return (
+    (status.includes('running') || status.includes('healthy')) &&
+    !status.includes('unhealthy') &&
+    !status.includes('error') &&
+    !status.includes('exited')
+  );
+}
+
+function safeProvisionDatabaseStatus(database: unknown): string {
+  return stringProperty(database, 'status') ?? 'unknown';
+}
+
+function internalPostgresUrl(database: Database): string {
+  if (typeof database.internal_db_url === 'string' && database.internal_db_url.length > 0) {
+    return database.internal_db_url;
+  }
+  if (
+    !database.uuid ||
+    !database.postgres_user ||
+    !database.postgres_password ||
+    !database.postgres_db
+  ) {
+    throw new Error('Coolify did not return the generated PostgreSQL connection metadata');
+  }
+  return `postgresql://${encodeURIComponent(database.postgres_user)}:${encodeURIComponent(database.postgres_password)}@${database.uuid}:5432/${encodeURIComponent(database.postgres_db)}`;
+}
+
+async function waitForPostgresReady(client: CoolifyClient, uuid: string): Promise<Database> {
+  const deadline = Date.now() + PROVISION_POSTGRES_READY_TIMEOUT_MS;
+  let last: Database | undefined;
+  while (Date.now() <= deadline) {
+    last = await client.getDatabase(uuid);
+    if (databaseIsReady(last)) return last;
+    const status = safeProvisionDatabaseStatus(last).toLowerCase();
+    if (status.includes('error') || status.includes('failed') || status.includes('exited')) {
+      throw new Error(
+        `managed PostgreSQL database did not become ready (status: ${safeProvisionDatabaseStatus(last)})`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, PROVISION_POSTGRES_POLL_INTERVAL_MS));
+  }
+  throw new Error(
+    `managed PostgreSQL database readiness timed out (last status: ${safeProvisionDatabaseStatus(last)})`,
+  );
+}
+
+function provisionError(client: CoolifyClient, error: unknown, secrets: string[]): string {
+  return redactSensitiveText(client.sanitizeError(error), secrets);
 }
 
 /** Wrap handler with error handling */
@@ -1191,6 +1373,349 @@ export class CoolifyMcpServer extends McpServer {
               {
                 type: 'text' as const,
                 text: `Error: create_application refused or failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.tool(
+      'provision_application_postgres',
+      'Guarded PostgreSQL provisioning and runtime-only application attachment. Dry-run is the default; apply=true is required for any mutation and never redeploys the application unless explicitly requested.',
+      {
+        application_uuid: z.string(),
+        project_uuid: z.string(),
+        environment_uuid: z.string().optional(),
+        environment_name: z.string().optional(),
+        server_uuid: z.string(),
+        destination_uuid: z.string(),
+        database_name: z.string(),
+        environment_variable_key: z.string(),
+        postgres_version: z.string().optional().default(PROVISION_POSTGRES_DEFAULT_VERSION),
+        storage_size: z.string().optional().default(PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE),
+        dry_run: z.boolean().default(true),
+        apply: z.boolean().default(false),
+        redeploy_application: z.boolean().optional().default(false),
+      },
+      async (rawArgs) => {
+        const args = rawArgs as ProvisionApplicationPostgresToolArgs;
+        const validationErrors = validateProvisionApplicationPostgresInput(args);
+        if (validationErrors.length > 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: provision_application_postgres refused: ${validationErrors.join('; ')}`,
+              },
+            ],
+          };
+        }
+
+        const applicationUuid = args.application_uuid!.trim();
+        const projectUuid = args.project_uuid!.trim();
+        const serverUuid = args.server_uuid!.trim();
+        const destinationUuid = args.destination_uuid!.trim();
+        const databaseName = args.database_name!.trim();
+        const variableKey = args.environment_variable_key!.trim();
+        const environmentUuid = args.environment_uuid?.trim();
+        const environmentName = args.environment_name?.trim();
+        const postgresVersion = args.postgres_version?.trim() || PROVISION_POSTGRES_DEFAULT_VERSION;
+        const storageSize = args.storage_size?.trim() || PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE;
+        const apply = args.apply === true;
+        const secrets: string[] = [];
+
+        try {
+          const [application, project, server, environments, resources, databaseSummaries] =
+            await Promise.all([
+              this.client.getApplication(applicationUuid),
+              this.client.getProject(projectUuid),
+              this.client.getServer(serverUuid),
+              this.client.listProjectEnvironments(projectUuid),
+              this.client.listResources({ include_full: true }),
+              this.client.listDatabases({ summary: true }),
+            ]);
+
+          if (!isRecord(application) || application.uuid !== applicationUuid) {
+            throw new Error('application_uuid could not be verified against Coolify');
+          }
+          if (!isRecord(project) || project.uuid !== projectUuid) {
+            throw new Error('project_uuid could not be verified against Coolify');
+          }
+          if (!isRecord(server) || server.uuid !== serverUuid) {
+            throw new Error('server_uuid could not be verified against Coolify');
+          }
+          if (server.is_usable === false || server.is_reachable === false) {
+            throw new Error('server_uuid identifies a server that is not usable');
+          }
+          if (!Array.isArray(environments)) {
+            throw new Error('Coolify returned a malformed environment response');
+          }
+          const environment = environments.find((item) => {
+            if (!isRecord(item)) return false;
+            return environmentUuid ? item.uuid === environmentUuid : item.name === environmentName;
+          });
+          if (!environment) {
+            throw new Error(
+              environmentUuid
+                ? 'environment_uuid was not found in the requested project'
+                : 'environment_name was not found in the requested project',
+            );
+          }
+          if (
+            typeof environment.project_uuid === 'string' &&
+            environment.project_uuid !== projectUuid
+          ) {
+            throw new Error('selected environment does not belong to project_uuid');
+          }
+          if (typeof environment.id !== 'number') {
+            throw new Error(
+              'Coolify did not return an environment id for safe application matching',
+            );
+          }
+          if (
+            typeof application.environment_id !== 'number' ||
+            application.environment_id !== environment.id
+          ) {
+            throw new Error('application_uuid does not belong to the selected project environment');
+          }
+
+          const applicationDestination = destinationUuidOf(application);
+          const applicationServer = destinationServerUuidOf(application);
+          if (applicationDestination !== destinationUuid || applicationServer !== serverUuid) {
+            throw new Error(
+              'application_uuid is not attached to the selected destination/server; refusing cross-destination database wiring',
+            );
+          }
+
+          const resourceList = Array.isArray(resources) ? resources : [];
+          const destinationVerified = resourceList.some(
+            (resource) =>
+              destinationUuidOf(resource) === destinationUuid &&
+              destinationServerUuidOf(resource) === serverUuid,
+          );
+          if (!destinationVerified) {
+            throw new Error('destination_uuid could not be verified as belonging to server_uuid');
+          }
+
+          const summaries = Array.isArray(databaseSummaries) ? databaseSummaries : [];
+          const postgresCandidates = summaries.filter((database) =>
+            databaseTypeOf(database).includes('postgres'),
+          );
+          const fullDatabases = await Promise.all(
+            postgresCandidates
+              .filter((database) => isRecord(database) && typeof database.uuid === 'string')
+              .map((database) => this.client.getDatabase(database.uuid as string)),
+          );
+          const conflictingDatabases = fullDatabases.filter((database) => {
+            if (!isRecord(database)) return false;
+            return database.name === databaseName || database.postgres_db === databaseName;
+          });
+          if (conflictingDatabases.length > 1) {
+            throw new Error(
+              'multiple PostgreSQL resources conflict with database_name; refusing to choose one',
+            );
+          }
+          const candidate = conflictingDatabases[0];
+          let existingDatabase: Database | undefined;
+          let databaseAction: 'create' | 'reuse' = 'create';
+          let existingStorage: Record<string, unknown> | undefined;
+          if (candidate) {
+            const exactName =
+              candidate.name === databaseName && candidate.postgres_db === databaseName;
+            const sameEnvironment =
+              environmentIdOf(candidate) === environment.id ||
+              candidate.environment_uuid === environment.uuid;
+            const sameDestination = destinationUuidOf(candidate) === destinationUuid;
+            const sameServer = destinationServerUuidOf(candidate) === serverUuid;
+            const sameProject =
+              typeof candidate.project_uuid !== 'string' || candidate.project_uuid === projectUuid;
+            if (!exactName || !sameEnvironment || !sameDestination || !sameServer || !sameProject) {
+              throw new Error(
+                'an existing database conflicts with the requested name or placement; refusing to overwrite it',
+              );
+            }
+            existingDatabase = candidate;
+            databaseAction = 'reuse';
+            existingStorage = (await this.client.listDatabaseStorages(
+              candidate.uuid,
+            )) as unknown as Record<string, unknown>;
+          }
+
+          const applicationEnvVars = await this.client.listApplicationEnvVars(applicationUuid, {
+            summary: true,
+          });
+          const existingVariable = Array.isArray(applicationEnvVars)
+            ? applicationEnvVars.find(
+                (variable) => isRecord(variable) && variable.key === variableKey,
+              )
+            : undefined;
+          const variableAction = existingVariable ? 'update' : 'create';
+          const persistentStorageExists =
+            isRecord(existingStorage) &&
+            Array.isArray(existingStorage.persistent_storages) &&
+            existingStorage.persistent_storages.some(
+              (storage) =>
+                isRecord(storage) && storage.mount_path === PROVISION_POSTGRES_DATA_MOUNT,
+            );
+
+          if (!apply) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    {
+                      operation_status: 'validated',
+                      dry_run: true,
+                      apply: false,
+                      database_uuid: existingDatabase?.uuid ?? null,
+                      database_name: databaseName,
+                      database_status: existingDatabase
+                        ? safeProvisionDatabaseStatus(existingDatabase)
+                        : 'not_created',
+                      database_action: databaseAction,
+                      postgres_version: postgresVersion,
+                      persistent_storage: {
+                        action: persistentStorageExists ? 'reuse' : 'create',
+                        type: 'persistent',
+                        mount_path: PROVISION_POSTGRES_DATA_MOUNT,
+                        requested_size: storageSize,
+                        coolify_managed: true,
+                      },
+                      application_uuid: applicationUuid,
+                      application_name: application.name,
+                      environment_variable_key: variableKey,
+                      variable_action: variableAction,
+                      variable_attached: false,
+                      created_or_reused: existingDatabase ? 'reused' : 'would_create',
+                      redeploy_required: args.redeploy_application !== true,
+                      message:
+                        'Dry-run only: no database, storage, variable, or redeployment was performed.',
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
+
+          let database = existingDatabase;
+          let createdDatabase = false;
+          if (!database) {
+            const created = await this.client.createPostgresql({
+              server_uuid: serverUuid,
+              project_uuid: projectUuid,
+              environment_uuid: environment.uuid,
+              destination_uuid: destinationUuid,
+              name: databaseName,
+              postgres_db: databaseName,
+              image: `postgres:${postgresVersion}`,
+              instant_deploy: true,
+            });
+            if (
+              !isRecord(created) ||
+              typeof created.uuid !== 'string' ||
+              !isSafeCoolifyResourceId(created.uuid)
+            ) {
+              throw new Error(
+                'Coolify returned malformed PostgreSQL creation metadata; retry using the existing resource if creation completed',
+              );
+            }
+            database = await this.client.getDatabase(created.uuid);
+            createdDatabase = true;
+          }
+
+          if (!databaseIsReady(database)) {
+            if (!createdDatabase) await this.client.startDatabase(database.uuid);
+            database = await waitForPostgresReady(this.client, database.uuid);
+          }
+
+          const storageState = (await this.client.listDatabaseStorages(
+            database.uuid,
+          )) as unknown as Record<string, unknown>;
+          const hasPersistentStorage =
+            Array.isArray(storageState.persistent_storages) &&
+            storageState.persistent_storages.some(
+              (storage) =>
+                isRecord(storage) && storage.mount_path === PROVISION_POSTGRES_DATA_MOUNT,
+            );
+          if (!hasPersistentStorage) {
+            await this.client.createDatabaseStorage(database.uuid, {
+              type: 'persistent',
+              name: `${databaseName}-data`,
+              mount_path: PROVISION_POSTGRES_DATA_MOUNT,
+            });
+          }
+
+          const connectionUrl = internalPostgresUrl(database);
+          secrets.push(
+            connectionUrl,
+            database.postgres_password ?? '',
+            database.internal_db_url ?? '',
+          );
+          const envData = {
+            key: variableKey,
+            value: connectionUrl,
+            is_buildtime: false,
+            is_runtime: true,
+          };
+          if (existingVariable) {
+            await this.client.updateApplicationEnvVar(applicationUuid, envData);
+          } else {
+            await this.client.createApplicationEnvVar(applicationUuid, envData);
+          }
+          const verifiedVariables = await this.client.listApplicationEnvVars(applicationUuid, {
+            summary: true,
+          });
+          const attached =
+            Array.isArray(verifiedVariables) &&
+            verifiedVariables.some(
+              (variable) =>
+                isRecord(variable) &&
+                variable.key === variableKey &&
+                variable.is_runtime === true &&
+                variable.is_buildtime === false,
+            );
+          if (!attached)
+            throw new Error(
+              'Coolify did not verify the runtime-only application variable attachment',
+            );
+
+          let redeployRequired = true;
+          if (args.redeploy_application === true) {
+            await this.client.restartApplication(applicationUuid);
+            redeployRequired = false;
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    database_uuid: database.uuid,
+                    database_name: databaseName,
+                    database_status: safeProvisionDatabaseStatus(database),
+                    application_uuid: applicationUuid,
+                    environment_variable_key: variableKey,
+                    variable_attached: true,
+                    created_or_reused: createdDatabase ? 'created' : 'reused',
+                    redeploy_required: redeployRequired,
+                    operation_status: 'completed',
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: provision_application_postgres failed safely: ${provisionError(this.client, error, secrets)}`,
               },
             ],
           };

@@ -249,8 +249,17 @@ export interface Application {
   project_uuid?: string;
   environment_uuid?: string;
   server_uuid?: string;
+  destination_uuid?: string;
+  destination?: CoolifyDestinationReference;
   created_at: string;
   updated_at: string;
+}
+
+export interface CoolifyDestinationReference {
+  uuid?: string;
+  name?: string;
+  network?: string;
+  server?: { uuid?: string; name?: string };
 }
 
 export interface CreateApplicationPublicRequest {
@@ -541,6 +550,8 @@ export interface Database {
   environment_uuid?: string;
   environment_name?: string;
   server_uuid?: string;
+  destination_uuid?: string;
+  destination?: CoolifyDestinationReference;
   limits?: DatabaseLimits;
   created_at: string;
   updated_at: string;

@@ -1098,6 +1098,383 @@ describe('CoolifyMcpServer v2', () => {
     });
   });
 
+  describe('provision_application_postgres tool handler', () => {
+    const ids = {
+      application_uuid: 'abcdefghijklmnopqrstuvwx',
+      project_uuid: 'bcdefghijklmnopqrstuvwxy',
+      environment_uuid: 'cdefghijklmnopqrstuvwxyz',
+      server_uuid: 'defghijklmnopqrstuvwxyza',
+      destination_uuid: 'efghijklmnopqrstuvwxyzaa',
+      database_uuid: 'fghijklmnopqrstuvwxyzaab',
+    };
+    const baseArgs = {
+      application_uuid: ids.application_uuid,
+      project_uuid: ids.project_uuid,
+      environment_name: ' production ',
+      server_uuid: ids.server_uuid,
+      destination_uuid: ` ${ids.destination_uuid} `,
+      database_name: 'managed_data',
+      environment_variable_key: 'MANAGED_DATABASE_URL',
+      postgres_version: '16',
+      storage_size: '10Gi',
+      dry_run: true,
+      apply: false,
+    };
+
+    const callProvision = async (
+      srv: CoolifyMcpServer,
+      args: Record<string, unknown>,
+    ): Promise<{ content: Array<{ text: string }> }> => {
+      const tool = (
+        srv as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools['provision_application_postgres'];
+      return (await tool.handler(args, {})) as { content: Array<{ text: string }> };
+    };
+
+    const mockPreflight = (srv: CoolifyMcpServer, databases: unknown[] = []): void => {
+      jest.spyOn(srv['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'generic-app',
+        environment_id: 1,
+        destination: {
+          uuid: ids.destination_uuid,
+          server: { uuid: ids.server_uuid },
+        },
+      } as never);
+      jest
+        .spyOn(srv['client'], 'getProject')
+        .mockResolvedValue({ uuid: ids.project_uuid } as never);
+      jest.spyOn(srv['client'], 'getServer').mockResolvedValue({
+        uuid: ids.server_uuid,
+        is_usable: true,
+        is_reachable: true,
+      } as never);
+      jest.spyOn(srv['client'], 'listProjectEnvironments').mockResolvedValue([
+        {
+          id: 1,
+          uuid: ids.environment_uuid,
+          name: 'production',
+          project_uuid: ids.project_uuid,
+        },
+      ] as never);
+      jest.spyOn(srv['client'], 'listResources').mockResolvedValue([
+        {
+          uuid: 'resource-uuid',
+          name: 'generic-app',
+          type: 'application',
+          destination: { uuid: ids.destination_uuid, server: { uuid: ids.server_uuid } },
+        },
+      ] as never);
+      jest.spyOn(srv['client'], 'listDatabases').mockResolvedValue(databases as never);
+      jest.spyOn(srv['client'], 'listApplicationEnvVars').mockResolvedValue([] as never);
+    };
+
+    const readyDatabase = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      uuid: ids.database_uuid,
+      name: 'managed_data',
+      postgres_db: 'managed_data',
+      database_type: 'standalone-postgresql',
+      status: 'running:healthy',
+      environment_id: 1,
+      destination: { uuid: ids.destination_uuid, server: { uuid: ids.server_uuid } },
+      internal_db_url: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+      postgres_password: 'super-secret',
+      ...overrides,
+    });
+
+    it('performs a generic dry-run without POSTs or secret output', async () => {
+      mockPreflight(server);
+      const createDatabase = jest.spyOn(server['client'], 'createPostgresql');
+      const createStorage = jest.spyOn(server['client'], 'createDatabaseStorage');
+      const createVariable = jest.spyOn(server['client'], 'createApplicationEnvVar');
+
+      const result = await callProvision(server, baseArgs);
+      const text = result.content[0]!.text;
+      const body = JSON.parse(text);
+
+      expect(body).toMatchObject({
+        operation_status: 'validated',
+        dry_run: true,
+        apply: false,
+        database_name: 'managed_data',
+        database_action: 'create',
+        application_uuid: ids.application_uuid,
+        environment_variable_key: 'MANAGED_DATABASE_URL',
+        variable_action: 'create',
+        variable_attached: false,
+      });
+      expect(body.persistent_storage).toMatchObject({
+        type: 'persistent',
+        mount_path: '/var/lib/postgresql/data',
+        requested_size: '10Gi',
+        coolify_managed: true,
+      });
+      expect(createDatabase).not.toHaveBeenCalled();
+      expect(createStorage).not.toHaveBeenCalled();
+      expect(createVariable).not.toHaveBeenCalled();
+      expect(text).not.toContain('super-secret');
+      expect(
+        (server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools[
+          'provision_application_postgres'
+        ],
+      ).toBeDefined();
+    });
+
+    it('validates malformed identifiers before any lookup', async () => {
+      const getApplication = jest.spyOn(server['client'], 'getApplication');
+      const result = await callProvision(server, {
+        ...baseArgs,
+        application_uuid: 'bad',
+        project_uuid: 'bad',
+        environment_uuid: 'bad',
+        environment_name: undefined,
+        server_uuid: 'bad',
+        destination_uuid: 'bad',
+      });
+
+      expect(result.content[0]!.text).toContain(
+        'application_uuid is not a valid Coolify resource identifier',
+      );
+      expect(result.content[0]!.text).toContain(
+        'environment_uuid is not a valid Coolify resource identifier',
+      );
+      expect(getApplication).not.toHaveBeenCalled();
+    });
+
+    it('rejects a destination/server mismatch before mutation', async () => {
+      mockPreflight(server);
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        environment_id: 1,
+        destination: { uuid: ids.destination_uuid, server: { uuid: 'different-server-uuid' } },
+      } as never);
+      const createDatabase = jest.spyOn(server['client'], 'createPostgresql');
+
+      const result = await callProvision(server, baseArgs);
+
+      expect(result.content[0]!.text).toContain('not attached to the selected destination/server');
+      expect(createDatabase).not.toHaveBeenCalled();
+    });
+
+    it('creates PostgreSQL with the selected context, persistent storage, and runtime-only variable', async () => {
+      mockPreflight(server);
+      const createDatabase = jest
+        .spyOn(server['client'], 'createPostgresql')
+        .mockResolvedValue({ uuid: ids.database_uuid });
+      jest.spyOn(server['client'], 'getDatabase').mockResolvedValue(readyDatabase() as never);
+      const listStorage = jest
+        .spyOn(server['client'], 'listDatabaseStorages')
+        .mockResolvedValue({ persistent_storages: [], file_storages: [] });
+      const createStorage = jest
+        .spyOn(server['client'], 'createDatabaseStorage')
+        .mockResolvedValue({ message: 'created' });
+      const createVariable = jest
+        .spyOn(server['client'], 'createApplicationEnvVar')
+        .mockResolvedValue({ uuid: 'env-uuid' });
+      jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValueOnce([] as never)
+        .mockResolvedValueOnce([
+          { key: 'MANAGED_DATABASE_URL', is_runtime: true, is_buildtime: false },
+        ] as never);
+
+      const result = await callProvision(server, {
+        ...baseArgs,
+        environment_name: undefined,
+        environment_uuid: ids.environment_uuid,
+        dry_run: false,
+        apply: true,
+      });
+      const text = result.content[0]!.text;
+      const body = JSON.parse(text);
+
+      expect(createDatabase).toHaveBeenCalledWith({
+        server_uuid: ids.server_uuid,
+        project_uuid: ids.project_uuid,
+        environment_uuid: ids.environment_uuid,
+        destination_uuid: ids.destination_uuid,
+        name: 'managed_data',
+        postgres_db: 'managed_data',
+        image: 'postgres:16',
+        instant_deploy: true,
+      });
+      expect(listStorage).toHaveBeenCalledWith(ids.database_uuid);
+      expect(createStorage).toHaveBeenCalledWith(ids.database_uuid, {
+        type: 'persistent',
+        name: 'managed_data-data',
+        mount_path: '/var/lib/postgresql/data',
+      });
+      expect(createVariable).toHaveBeenCalledWith(ids.application_uuid, {
+        key: 'MANAGED_DATABASE_URL',
+        value: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+        is_buildtime: false,
+        is_runtime: true,
+      });
+      expect(body).toEqual({
+        database_uuid: ids.database_uuid,
+        database_name: 'managed_data',
+        database_status: 'running:healthy',
+        application_uuid: ids.application_uuid,
+        environment_variable_key: 'MANAGED_DATABASE_URL',
+        variable_attached: true,
+        created_or_reused: 'created',
+        redeploy_required: true,
+        operation_status: 'completed',
+      });
+      expect(text).not.toContain('super-secret');
+      expect(text).not.toContain('postgresql://');
+    });
+
+    it('reuses an exact compatible database and updates an existing attachment', async () => {
+      mockPreflight(server, [
+        { uuid: ids.database_uuid, name: 'managed_data', type: 'postgresql' },
+      ]);
+      const database = readyDatabase();
+      jest.spyOn(server['client'], 'getDatabase').mockResolvedValue(database as never);
+      jest.spyOn(server['client'], 'listDatabaseStorages').mockResolvedValue({
+        persistent_storages: [{ mount_path: '/var/lib/postgresql/data' }],
+        file_storages: [],
+      } as never);
+      const createDatabase = jest.spyOn(server['client'], 'createPostgresql');
+      const updateVariable = jest
+        .spyOn(server['client'], 'updateApplicationEnvVar')
+        .mockResolvedValue({ message: 'updated' });
+      jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValueOnce([
+          { key: 'MANAGED_DATABASE_URL', is_runtime: false, is_buildtime: true },
+        ] as never)
+        .mockResolvedValueOnce([
+          { key: 'MANAGED_DATABASE_URL', is_runtime: true, is_buildtime: false },
+        ] as never);
+
+      const result = await callProvision(server, { ...baseArgs, dry_run: false, apply: true });
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createDatabase).not.toHaveBeenCalled();
+      expect(updateVariable).toHaveBeenCalledWith(ids.application_uuid, {
+        key: 'MANAGED_DATABASE_URL',
+        value: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+        is_buildtime: false,
+        is_runtime: true,
+      });
+      expect(body.created_or_reused).toBe('reused');
+      expect(body.variable_attached).toBe(true);
+      expect(result.content[0]!.text).not.toContain('super-secret');
+    });
+
+    it('refuses a conflicting database without deleting or overwriting it', async () => {
+      mockPreflight(server, [
+        { uuid: ids.database_uuid, name: 'managed_data', type: 'postgresql' },
+      ]);
+      jest
+        .spyOn(server['client'], 'getDatabase')
+        .mockResolvedValue(readyDatabase({ postgres_db: 'different_database' }) as never);
+      const createDatabase = jest.spyOn(server['client'], 'createPostgresql');
+      const deleteDatabase = jest.spyOn(server['client'], 'deleteDatabase');
+
+      const result = await callProvision(server, { ...baseArgs, dry_run: false, apply: true });
+
+      expect(result.content[0]!.text).toContain('conflicts with the requested name or placement');
+      expect(createDatabase).not.toHaveBeenCalled();
+      expect(deleteDatabase).not.toHaveBeenCalled();
+    });
+
+    it('redacts generated credentials from attachment failures and preserves retry state', async () => {
+      mockPreflight(server);
+      jest
+        .spyOn(server['client'], 'createPostgresql')
+        .mockResolvedValue({ uuid: ids.database_uuid });
+      jest.spyOn(server['client'], 'getDatabase').mockResolvedValue(readyDatabase() as never);
+      jest.spyOn(server['client'], 'listDatabaseStorages').mockResolvedValue({
+        persistent_storages: [{ mount_path: '/var/lib/postgresql/data' }],
+        file_storages: [],
+      } as never);
+      jest
+        .spyOn(server['client'], 'createApplicationEnvVar')
+        .mockRejectedValue(
+          new Error(
+            'attachment failed password=super-secret postgresql://postgres:super-secret@managed_data:5432/managed_data',
+          ),
+        );
+      const deleteDatabase = jest.spyOn(server['client'], 'deleteDatabase');
+
+      const result = await callProvision(server, { ...baseArgs, dry_run: false, apply: true });
+      const text = result.content[0]!.text;
+
+      expect(text).not.toContain('super-secret');
+      expect(text).not.toContain('postgresql://');
+      expect(text).toContain('attachment failed');
+      expect(deleteDatabase).not.toHaveBeenCalled();
+    });
+
+    it('reports a redacted readiness timeout without deleting the managed database', async () => {
+      jest.useFakeTimers();
+      try {
+        mockPreflight(server);
+        jest
+          .spyOn(server['client'], 'createPostgresql')
+          .mockResolvedValue({ uuid: ids.database_uuid });
+        jest
+          .spyOn(server['client'], 'getDatabase')
+          .mockResolvedValue(readyDatabase({ status: 'starting' }) as never);
+        jest.spyOn(server['client'], 'listDatabaseStorages').mockResolvedValue({
+          persistent_storages: [],
+          file_storages: [],
+        });
+        const deleteDatabase = jest.spyOn(server['client'], 'deleteDatabase');
+
+        const resultPromise = callProvision(server, { ...baseArgs, dry_run: false, apply: true });
+        await jest.advanceTimersByTimeAsync(31_000);
+        const result = await resultPromise;
+
+        expect(result.content[0]!.text).toContain('readiness timed out');
+        expect(deleteDatabase).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('supports explicit application redeployment only after a successful attachment', async () => {
+      mockPreflight(server);
+      jest
+        .spyOn(server['client'], 'createPostgresql')
+        .mockResolvedValue({ uuid: ids.database_uuid });
+      jest.spyOn(server['client'], 'getDatabase').mockResolvedValue(readyDatabase() as never);
+      jest.spyOn(server['client'], 'listDatabaseStorages').mockResolvedValue({
+        persistent_storages: [{ mount_path: '/var/lib/postgresql/data' }],
+        file_storages: [],
+      } as never);
+      jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValueOnce([] as never)
+        .mockResolvedValueOnce([
+          { key: 'MANAGED_DATABASE_URL', is_runtime: true, is_buildtime: false },
+        ] as never);
+      jest
+        .spyOn(server['client'], 'createApplicationEnvVar')
+        .mockResolvedValue({ uuid: 'env-uuid' });
+      const restart = jest
+        .spyOn(server['client'], 'restartApplication')
+        .mockResolvedValue({ message: 'restarted' });
+
+      const result = await callProvision(server, {
+        ...baseArgs,
+        dry_run: false,
+        apply: true,
+        redeploy_application: true,
+      });
+
+      expect(restart).toHaveBeenCalledWith(ids.application_uuid);
+      expect(JSON.parse(result.content[0]!.text).redeploy_required).toBe(false);
+    });
+  });
+
   describe('deployment tool handler (#232 essential projection)', () => {
     // Regression for #232: `deployment {action: get, lines: N}` used to call
     // getDeployment(uuid, { includeLogs: true }) and spread the RAW upstream
