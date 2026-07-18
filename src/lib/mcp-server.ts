@@ -35,6 +35,7 @@ const _require = createRequire(import.meta.url);
 export const VERSION: string = _require('../../package.json').version;
 
 const CREATE_APPLICATION_ENDPOINT = '/api/v1/applications/public';
+const CREATE_APPLICATION_PRIVATE_KEY_ENDPOINT = '/api/v1/applications/private-deploy-key';
 const COOLIFY_RESOURCE_ID =
   /^(?:[a-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const CREATE_APPLICATION_BUILD_PACKS = [
@@ -54,6 +55,7 @@ interface CreateApplicationToolArgs {
   environment_uuid?: string;
   environment_name?: string;
   destination_uuid?: string;
+  private_key_uuid?: string;
   build_pack?: string;
   build_type?: string;
   dockerfile_location?: string;
@@ -110,6 +112,7 @@ export function validateCreateApplicationInput(args: CreateApplicationToolArgs):
   const environmentUuid = args.environment_uuid?.trim();
   const environmentName = args.environment_name?.trim();
   const destinationUuid = args.destination_uuid?.trim();
+  const privateKeyUuid = args.private_key_uuid?.trim();
   if (args.environment_uuid !== undefined && !environmentUuid) {
     errors.push('environment_uuid must not be blank');
   }
@@ -129,6 +132,12 @@ export function validateCreateApplicationInput(args: CreateApplicationToolArgs):
   }
   if (destinationUuid && !isSafeCoolifyResourceId(destinationUuid)) {
     errors.push('destination_uuid is not a valid Coolify resource identifier');
+  }
+  if (args.private_key_uuid !== undefined && !privateKeyUuid) {
+    errors.push('private_key_uuid must not be blank');
+  }
+  if (privateKeyUuid && !isSafeCoolifyResourceId(privateKeyUuid)) {
+    errors.push('private_key_uuid is not a valid Coolify resource identifier');
   }
   for (const field of ['name', 'git_repository', 'git_branch'] as const) {
     if (!args[field]?.trim()) errors.push(`${field} is required`);
@@ -207,6 +216,7 @@ function createApplicationPayload(args: CreateApplicationToolArgs): Record<strin
   const environmentUuid = args.environment_uuid?.trim();
   const environmentName = args.environment_name?.trim();
   const destinationUuid = args.destination_uuid?.trim();
+  const privateKeyUuid = args.private_key_uuid?.trim();
   return {
     project_uuid: args.project_uuid!.trim(),
     server_uuid: args.server_uuid!.trim(),
@@ -214,6 +224,7 @@ function createApplicationPayload(args: CreateApplicationToolArgs): Record<strin
       ? { environment_uuid: environmentUuid }
       : { environment_name: environmentName }),
     ...(destinationUuid ? { destination_uuid: destinationUuid } : {}),
+    ...(privateKeyUuid ? { private_key_uuid: privateKeyUuid } : {}),
     name: args.name!.trim(),
     git_repository: args.git_repository!.trim(),
     git_branch: args.git_branch!.trim(),
@@ -494,6 +505,118 @@ interface ApplicationMutationPreflight {
   reason?: string;
   current_status?: string;
   active_deployments: number;
+}
+
+interface DeployApplicationToolArgs {
+  application_uuid?: string;
+  force_rebuild?: boolean;
+  execute?: boolean;
+}
+
+interface DeleteApplicationToolArgs {
+  application_uuid?: string;
+  expected_name?: string;
+  execute?: boolean;
+}
+
+const ACTIVE_DEPLOYMENT_STATUSES = new Set([
+  'queued',
+  'in_progress',
+  'running',
+  'building',
+  'deploying',
+  'pending',
+  'waiting',
+]);
+
+function validateApplicationUuid(value: string | undefined): string[] {
+  const trimmed = value?.trim();
+  if (!trimmed) return ['application_uuid is required'];
+  if (!isSafeCoolifyResourceId(trimmed)) {
+    return ['application_uuid is not a valid Coolify resource identifier'];
+  }
+  return [];
+}
+
+function validateDeployApplicationInput(args: DeployApplicationToolArgs): string[] {
+  return validateApplicationUuid(args.application_uuid);
+}
+
+function validateDeleteApplicationInput(args: DeleteApplicationToolArgs): string[] {
+  return [
+    ...validateApplicationUuid(args.application_uuid),
+    ...(args.expected_name?.trim() ? [] : ['expected_name must not be blank']),
+  ];
+}
+
+function activeDeployments(deployments: unknown[]): SafeDeploymentRead[] {
+  return deployments
+    .filter(isRecord)
+    .filter((deployment) =>
+      ACTIVE_DEPLOYMENT_STATUSES.has(String(deployment.status ?? '').toLowerCase()),
+    )
+    .map((deployment) => summarizeDeploymentForRead(deployment));
+}
+
+function safePrivateKeyMetadata(
+  rawKey: unknown,
+  applications?: Record<string, unknown>[],
+): Record<string, unknown> {
+  const key = isRecord(rawKey) ? rawKey : {};
+  const keyId = key.id;
+  const keyUuid = typeof key.uuid === 'string' ? key.uuid : undefined;
+  const usedBy = applications?.filter((application) => {
+    const privateKeyUuid = application.private_key_uuid;
+    const privateKeyId = application.private_key_id;
+    return (
+      (keyUuid !== undefined && privateKeyUuid === keyUuid) ||
+      (typeof keyId === 'number' && privateKeyId === keyId)
+    );
+  });
+  return {
+    uuid: key.uuid,
+    name: key.name,
+    ...(key.description !== undefined ? { description: key.description } : {}),
+    ...(key.created_at !== undefined ? { created_at: key.created_at } : {}),
+    ...(key.updated_at !== undefined ? { updated_at: key.updated_at } : {}),
+    ...(key.is_git_related !== undefined ? { is_git_related: key.is_git_related } : {}),
+    ...(usedBy
+      ? {
+          used_by_applications: usedBy.length > 0,
+          used_by_application_count: usedBy.length,
+        }
+      : {}),
+    secrets_redacted: true,
+  };
+}
+
+function safeApplicationLifecycleView(
+  application: Record<string, unknown>,
+  deployments: unknown[],
+): Record<string, unknown> {
+  return {
+    application_uuid: application.uuid,
+    name: application.name,
+    repository: application.git_repository,
+    branch: application.git_branch,
+    domain: application.fqdn ?? application.domains ?? null,
+    status: application.status ?? null,
+    active_deployments: activeDeployments(deployments),
+  };
+}
+
+function deploymentUuidFromTrigger(response: unknown): string | undefined {
+  if (!isRecord(response)) return undefined;
+  const direct = response.deployment_uuid ?? response.uuid;
+  if (typeof direct === 'string' && direct.trim()) return direct;
+  if (Array.isArray(response.deployments)) {
+    for (const deployment of response.deployments) {
+      if (!isRecord(deployment)) continue;
+      const uuid = deployment.deployment_uuid ?? deployment.uuid;
+      if (typeof uuid === 'string' && uuid.trim()) return uuid;
+    }
+  }
+  return undefined;
 }
 
 interface SafeDeploymentRead {
@@ -1217,6 +1340,7 @@ export class CoolifyMcpServer extends McpServer {
         environment_uuid: z.string().optional(),
         environment_name: z.string().optional(),
         destination_uuid: z.string().optional(),
+        private_key_uuid: z.string().optional(),
         build_pack: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
         build_type: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
         dockerfile_location: z.string().optional(),
@@ -1246,6 +1370,9 @@ export class CoolifyMcpServer extends McpServer {
         }
 
         const payload = createApplicationPayload(args);
+        const endpoint = args.private_key_uuid?.trim()
+          ? CREATE_APPLICATION_PRIVATE_KEY_ENDPOINT
+          : CREATE_APPLICATION_ENDPOINT;
         if (args.execute !== true) {
           return {
             content: [
@@ -1258,7 +1385,7 @@ export class CoolifyMcpServer extends McpServer {
                     created: false,
                     deployed: false,
                     message: 'Preview only: no Coolify application was created.',
-                    endpoint: CREATE_APPLICATION_ENDPOINT,
+                    endpoint,
                     payload,
                   },
                   null,
@@ -1301,6 +1428,13 @@ export class CoolifyMcpServer extends McpServer {
                 : 'environment_name was not found in the requested project',
             );
           }
+
+          if (args.private_key_uuid?.trim()) {
+            const privateKey = await this.client.getPrivateKey(args.private_key_uuid.trim());
+            if (!isRecord(privateKey) || privateKey.uuid !== args.private_key_uuid.trim()) {
+              throw new Error('private_key_uuid could not be verified against Coolify');
+            }
+          }
           if (
             typeof environment.project_uuid === 'string' &&
             environment.project_uuid !== args.project_uuid!.trim()
@@ -1329,7 +1463,9 @@ export class CoolifyMcpServer extends McpServer {
             );
           }
 
-          const created = await this.client.createApplicationPublic(payload as any);
+          const created = args.private_key_uuid?.trim()
+            ? await this.client.createApplicationPrivateKey(payload as any)
+            : await this.client.createApplicationPublic(payload as any);
           if (
             !isRecord(created) ||
             typeof created.uuid !== 'string' ||
@@ -1358,7 +1494,7 @@ export class CoolifyMcpServer extends McpServer {
                     created: true,
                     deployed: false,
                     message: 'Application created. No deployment was requested or started.',
-                    endpoint: CREATE_APPLICATION_ENDPOINT,
+                    endpoint,
                     application: safeApplication,
                   },
                   null,
@@ -1373,6 +1509,269 @@ export class CoolifyMcpServer extends McpServer {
               {
                 type: 'text' as const,
                 text: `Error: create_application refused or failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.tool(
+      'list_private_keys',
+      'List existing Coolify private keys as safe metadata only; key material is never returned.',
+      {},
+      async () => {
+        try {
+          const [keysResult, applicationsResult] = await Promise.allSettled([
+            this.client.listPrivateKeys(),
+            this.client.listApplications(),
+          ]);
+          if (keysResult.status === 'rejected') throw keysResult.reason;
+          const keys = Array.isArray(keysResult.value) ? keysResult.value : [];
+          const applications =
+            applicationsResult.status === 'fulfilled' && Array.isArray(applicationsResult.value)
+              ? applicationsResult.value.map(
+                  (application) => application as unknown as Record<string, unknown>,
+                )
+              : undefined;
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    keys: keys
+                      .filter(isRecord)
+                      .map((key) => safePrivateKeyMetadata(key, applications)),
+                    secrets_redacted: true,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: list_private_keys failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.tool(
+      'deploy_application',
+      'Preview or explicitly deploy exactly one existing application. Preview is the default and active deployments block duplicates.',
+      {
+        application_uuid: z.string(),
+        force_rebuild: z.boolean().optional().default(false),
+        execute: z.boolean().default(false),
+      },
+      async (rawArgs) => {
+        const args = rawArgs as DeployApplicationToolArgs;
+        const validationErrors = validateDeployApplicationInput(args);
+        if (validationErrors.length > 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: deploy_application refused: ${validationErrors.join('; ')}`,
+              },
+            ],
+          };
+        }
+        const applicationUuid = args.application_uuid!.trim();
+        const forceRebuild = args.force_rebuild ?? false;
+        try {
+          const [application, deploymentEnvelope] = await Promise.all([
+            this.client.getApplication(applicationUuid),
+            this.client.listApplicationDeployments(applicationUuid),
+          ]);
+          if (!isRecord(application) || application.uuid !== applicationUuid) {
+            throw new Error('application_uuid could not be verified against Coolify');
+          }
+          const deployments = Array.isArray(deploymentEnvelope.deployments)
+            ? deploymentEnvelope.deployments.filter(isRecord)
+            : [];
+          const active = activeDeployments(deployments);
+          const view = safeApplicationLifecycleView(application, deployments);
+          const request = {
+            method: 'GET',
+            endpoint: `/api/v1/deploy?uuid=${encodeURIComponent(applicationUuid)}&force=${forceRebuild}`,
+          };
+          if (args.execute !== true) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    {
+                      mode: 'preview',
+                      execute: false,
+                      ...view,
+                      active_deployments: active,
+                      deployment_request: request,
+                      deployment_started: false,
+                      message: 'Preview only: no deployment was started.',
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
+          if (active.length > 0) {
+            throw new Error(
+              `active deployment exists for application ${applicationUuid}; refusing duplicate deployment`,
+            );
+          }
+          const trigger = await this.client.deployByTagOrUuid(applicationUuid, forceRebuild);
+          const deploymentUuid = deploymentUuidFromTrigger(trigger);
+          if (!deploymentUuid) {
+            throw new Error('Coolify returned no deployment UUID; refusing to report success');
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    mode: 'execute',
+                    execute: true,
+                    application_uuid: applicationUuid,
+                    deployment_uuid: deploymentUuid,
+                    force_rebuild: forceRebuild,
+                    deployment_started: true,
+                    operation_status: 'triggered',
+                    active_deployments_before_request: 0,
+                    message:
+                      'Exactly one deployment request was sent; no retry or wait was performed.',
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: deploy_application refused or failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.tool(
+      'delete_application',
+      'Preview or explicitly delete exactly one existing application after an exact name check. Preview is the default and active deployments block deletion.',
+      {
+        application_uuid: z.string(),
+        expected_name: z.string(),
+        execute: z.boolean().default(false),
+      },
+      async (rawArgs) => {
+        const args = rawArgs as DeleteApplicationToolArgs;
+        const validationErrors = validateDeleteApplicationInput(args);
+        if (validationErrors.length > 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: delete_application refused: ${validationErrors.join('; ')}`,
+              },
+            ],
+          };
+        }
+        const applicationUuid = args.application_uuid!.trim();
+        const expectedName = args.expected_name!.trim();
+        try {
+          const [application, deploymentEnvelope] = await Promise.all([
+            this.client.getApplication(applicationUuid),
+            this.client.listApplicationDeployments(applicationUuid),
+          ]);
+          if (!isRecord(application) || application.uuid !== applicationUuid) {
+            throw new Error('application_uuid could not be verified against Coolify');
+          }
+          if (application.name !== expectedName) {
+            throw new Error(
+              `expected_name does not exactly match the application name for ${applicationUuid}`,
+            );
+          }
+          const deployments = Array.isArray(deploymentEnvelope.deployments)
+            ? deploymentEnvelope.deployments.filter(isRecord)
+            : [];
+          const active = activeDeployments(deployments);
+          const view = safeApplicationLifecycleView(application, deployments);
+          const deletion = {
+            method: 'DELETE',
+            endpoint: `/api/v1/applications/${encodeURIComponent(applicationUuid)}`,
+            scope: 'application only; no explicit volume/configuration deletion flags',
+          };
+          if (args.execute !== true) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    {
+                      mode: 'preview',
+                      execute: false,
+                      ...view,
+                      active_deployments: active,
+                      deletion_request: deletion,
+                      deletion_started: false,
+                      message: 'Preview only: no application was deleted.',
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
+          if (active.length > 0) {
+            throw new Error(
+              `active deployment exists for application ${applicationUuid}; refusing deletion`,
+            );
+          }
+          await this.client.deleteApplication(applicationUuid);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    mode: 'execute',
+                    execute: true,
+                    application_uuid: applicationUuid,
+                    name: expectedName,
+                    deleted: true,
+                    operation_status: 'deleted',
+                    message: 'Exactly one application deletion request completed.',
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: delete_application refused or failed safely: ${this.client.sanitizeError(error)}`,
               },
             ],
           };
@@ -2817,26 +3216,52 @@ export class CoolifyMcpServer extends McpServer {
       async ({ action, uuid, name, description, private_key }) => {
         switch (action) {
           case 'list':
-            return wrap(() => this.client.listPrivateKeys());
+            return wrap(async () => {
+              const [keys, applications] = await Promise.all([
+                this.client.listPrivateKeys(),
+                this.client.listApplications(),
+              ]);
+              return {
+                keys: keys.filter(isRecord).map((key) =>
+                  safePrivateKeyMetadata(
+                    key,
+                    applications.map(
+                      (application) => application as unknown as Record<string, unknown>,
+                    ),
+                  ),
+                ),
+                secrets_redacted: true,
+              };
+            });
           case 'get':
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() => this.client.getPrivateKey(uuid));
+            return wrap(async () =>
+              safePrivateKeyMetadata((await this.client.getPrivateKey(uuid)) as any),
+            );
           case 'create':
             if (!private_key)
               return { content: [{ type: 'text' as const, text: 'Error: private_key required' }] };
-            return wrap(() =>
-              this.client.createPrivateKey({
-                private_key,
-                name: name || 'unnamed-key',
-                description,
-              }),
+            return wrap(async () =>
+              safePrivateKeyMetadata(
+                (await this.client.createPrivateKey({
+                  private_key,
+                  name: name || 'unnamed-key',
+                  description,
+                })) as any,
+              ),
             );
           case 'update':
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() =>
-              this.client.updatePrivateKey(uuid, { name, description, private_key }),
+            return wrap(async () =>
+              safePrivateKeyMetadata(
+                (await this.client.updatePrivateKey(uuid, {
+                  name,
+                  description,
+                  private_key,
+                })) as any,
+              ),
             );
           case 'delete':
             if (!uuid)

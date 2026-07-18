@@ -1040,6 +1040,364 @@ describe('CoolifyMcpServer v2', () => {
     });
   });
 
+  describe('private key and application lifecycle tools', () => {
+    const ids = {
+      application_uuid: 'abcdefghijklmnopqrstuvwx',
+      project_uuid: 'bcdefghijklmnopqrstuvwxy',
+      environment_uuid: 'cdefghijklmnopqrstuvwxyz',
+      server_uuid: 'defghijklmnopqrstuvwxyza',
+      private_key_uuid: 'efghijklmnopqrstuvwxyzaa',
+    };
+
+    const toolHandler = (name: string) =>
+      (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools[name]!.handler;
+
+    const createArgs = {
+      name: 'private-repo-app',
+      git_repository: 'git@github.com:example/private.git',
+      git_branch: 'main',
+      server_uuid: ids.server_uuid,
+      project_uuid: ids.project_uuid,
+      environment_uuid: ids.environment_uuid,
+      destination_uuid: 'fghijklmnopqrstuvwxyzaab',
+      private_key_uuid: ` ${ids.private_key_uuid} `,
+      build_pack: 'dockerfile',
+      ports_exposes: '8080',
+      execute: false,
+    };
+
+    const mockCreatePreflight = (): void => {
+      jest.spyOn(server['client'], 'getServer').mockResolvedValue({
+        uuid: ids.server_uuid,
+        is_usable: true,
+      } as never);
+      jest
+        .spyOn(server['client'], 'getProject')
+        .mockResolvedValue({ uuid: ids.project_uuid } as never);
+      jest
+        .spyOn(server['client'], 'listProjectEnvironments')
+        .mockResolvedValue([{ uuid: ids.environment_uuid }] as never);
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([]);
+      jest
+        .spyOn(server['client'], 'getPrivateKey')
+        .mockResolvedValue({ uuid: ids.private_key_uuid } as never);
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: createArgs.name,
+      } as never);
+    };
+
+    it('lists private keys as metadata and omits all key material', async () => {
+      jest.spyOn(server['client'], 'listPrivateKeys').mockResolvedValue([
+        {
+          id: 7,
+          uuid: ids.private_key_uuid,
+          name: 'repo key',
+          description: 'safe description',
+          private_key: '-----BEGIN PRIVATE KEY-----SECRET',
+          public_key: 'ssh-ed25519 PUBLIC',
+          fingerprint: 'SHA256:sensitive',
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-02T00:00:00Z',
+        },
+      ] as never);
+      jest
+        .spyOn(server['client'], 'listApplications')
+        .mockResolvedValue([{ uuid: ids.application_uuid, private_key_id: 7 }] as never);
+
+      const result = (await toolHandler('list_private_keys')({}, {})) as {
+        content: Array<{ text: string }>;
+      };
+      const text = result.content[0]!.text;
+      const body = JSON.parse(text);
+
+      expect(body.keys).toEqual([
+        expect.objectContaining({
+          uuid: ids.private_key_uuid,
+          name: 'repo key',
+          used_by_applications: true,
+          used_by_application_count: 1,
+          secrets_redacted: true,
+        }),
+      ]);
+      expect(text).not.toContain('BEGIN PRIVATE KEY');
+      expect(text).not.toContain('ssh-ed25519 PUBLIC');
+      expect(text).not.toContain('SHA256:sensitive');
+    });
+
+    it('fails safely when private-key listing fails', async () => {
+      jest
+        .spyOn(server['client'], 'listPrivateKeys')
+        .mockRejectedValue(new Error('upstream private_key=super-secret'));
+
+      const result = (await toolHandler('list_private_keys')({}, {})) as {
+        content: Array<{ text: string }>;
+      };
+
+      expect(result.content[0]!.text).toContain('failed safely');
+      expect(result.content[0]!.text).not.toContain('super-secret');
+    });
+
+    it('returns an empty safe list when Coolify has no private keys', async () => {
+      jest.spyOn(server['client'], 'listPrivateKeys').mockResolvedValue([]);
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([]);
+
+      const result = (await toolHandler('list_private_keys')({}, {})) as {
+        content: Array<{ text: string }>;
+      };
+
+      expect(JSON.parse(result.content[0]!.text)).toMatchObject({
+        keys: [],
+        secrets_redacted: true,
+      });
+    });
+
+    it('previews private-key application creation with the exact supplied key and no POST', async () => {
+      const createPublic = jest.spyOn(server['client'], 'createApplicationPublic');
+      const createPrivate = jest.spyOn(server['client'], 'createApplicationPrivateKey');
+
+      const result = (await toolHandler('create_application')(createArgs, {})) as {
+        content: Array<{ text: string }>;
+      };
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(body.endpoint).toBe('/api/v1/applications/private-deploy-key');
+      expect(body.payload.private_key_uuid).toBe(ids.private_key_uuid);
+      expect(createPublic).not.toHaveBeenCalled();
+      expect(createPrivate).not.toHaveBeenCalled();
+    });
+
+    it('executes private-key creation with the exact key and never deploys', async () => {
+      mockCreatePreflight();
+      const createPrivate = jest
+        .spyOn(server['client'], 'createApplicationPrivateKey')
+        .mockResolvedValue({ uuid: ids.application_uuid });
+      const deploy = jest.spyOn(server['client'], 'deployByTagOrUuid');
+
+      const result = (await toolHandler('create_application')(
+        { ...createArgs, execute: true },
+        {},
+      )) as {
+        content: Array<{ text: string }>;
+      };
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createPrivate).toHaveBeenCalledWith(
+        expect.objectContaining({ private_key_uuid: ids.private_key_uuid }),
+      );
+      expect(deploy).not.toHaveBeenCalled();
+      expect(body.deployed).toBe(false);
+    });
+
+    it('rejects blank and malformed private-key UUIDs', async () => {
+      const blank = (await toolHandler('create_application')(
+        { ...createArgs, private_key_uuid: '  ' },
+        {},
+      )) as {
+        content: Array<{ text: string }>;
+      };
+      const malformed = (await toolHandler('create_application')(
+        { ...createArgs, private_key_uuid: 'bad' },
+        {},
+      )) as {
+        content: Array<{ text: string }>;
+      };
+
+      expect(blank.content[0]!.text).toContain('private_key_uuid must not be blank');
+      expect(malformed.content[0]!.text).toContain(
+        'private_key_uuid is not a valid Coolify resource identifier',
+      );
+    });
+
+    it('previews deployment without mutation and defaults execute to false', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+        git_repository: createArgs.git_repository,
+        git_branch: 'main',
+        status: 'exited:unhealthy',
+        fqdn: 'https://private.example.com',
+      } as never);
+      jest.spyOn(server['client'], 'listApplicationDeployments').mockResolvedValue({
+        count: 0,
+        deployments: [],
+      });
+      const trigger = jest.spyOn(server['client'], 'deployByTagOrUuid');
+
+      const result = (await toolHandler('deploy_application')(
+        {
+          application_uuid: ` ${ids.application_uuid} `,
+          force_rebuild: false,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(body.execute).toBe(false);
+      expect(body.deployment_request.endpoint).toBe(
+        `/api/v1/deploy?uuid=${ids.application_uuid}&force=false`,
+      );
+      expect(body.deployment_started).toBe(false);
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it('rejects active deployment and sends exactly one deployment request otherwise', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+      } as never);
+      const deployments = jest
+        .spyOn(server['client'], 'listApplicationDeployments')
+        .mockResolvedValue({
+          count: 1,
+          deployments: [{ deployment_uuid: 'active-deployment', status: 'queued' }],
+        } as never);
+      const trigger = jest
+        .spyOn(server['client'], 'deployByTagOrUuid')
+        .mockResolvedValue({ deployments: [{ deployment_uuid: 'new-deployment' }] });
+
+      const blocked = (await toolHandler('deploy_application')(
+        {
+          application_uuid: ids.application_uuid,
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      expect(blocked.content[0]!.text).toContain('active deployment exists');
+      expect(trigger).not.toHaveBeenCalled();
+
+      deployments.mockResolvedValue({ count: 0, deployments: [] });
+      const executed = (await toolHandler('deploy_application')(
+        {
+          application_uuid: ids.application_uuid,
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(executed.content[0]!.text);
+      expect(trigger).toHaveBeenCalledTimes(1);
+      expect(body.deployment_uuid).toBe('new-deployment');
+    });
+
+    it('surfaces a deployment failure without retrying', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+      } as never);
+      jest.spyOn(server['client'], 'listApplicationDeployments').mockResolvedValue({
+        count: 0,
+        deployments: [],
+      });
+      const trigger = jest
+        .spyOn(server['client'], 'deployByTagOrUuid')
+        .mockRejectedValue(new Error('upstream deployment failed'));
+
+      const result = (await toolHandler('deploy_application')(
+        { application_uuid: ids.application_uuid, execute: true },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      expect(result.content[0]!.text).toContain('upstream deployment failed');
+      expect(trigger).toHaveBeenCalledTimes(1);
+    });
+
+    it('previews deletion, enforces exact name, and blocks active deployments', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+        git_repository: createArgs.git_repository,
+        git_branch: 'main',
+        status: 'exited:unhealthy',
+        fqdn: 'https://private.example.com',
+      } as never);
+      const deployments = jest
+        .spyOn(server['client'], 'listApplicationDeployments')
+        .mockResolvedValue({ count: 0, deployments: [] });
+      const deleteSpy = jest
+        .spyOn(server['client'], 'deleteApplication')
+        .mockResolvedValue({ message: 'deleted' });
+
+      const preview = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(preview.content[0]!.text);
+      expect(body.execute).toBe(false);
+      expect(body.deletion_started).toBe(false);
+      expect(deleteSpy).not.toHaveBeenCalled();
+
+      await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+          execute: true,
+        },
+        {},
+      );
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(deleteSpy).toHaveBeenCalledWith(ids.application_uuid);
+
+      const mismatch = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'wrong-name',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      expect(mismatch.content[0]!.text).toContain('does not exactly match');
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+
+      deployments.mockResolvedValue({
+        count: 1,
+        deployments: [{ deployment_uuid: 'active-deployment', status: 'in_progress' } as never],
+      } as never);
+      const blocked = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      expect(blocked.content[0]!.text).toContain('active deployment exists');
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects malformed lifecycle UUIDs before lookup', async () => {
+      const getApplication = jest.spyOn(server['client'], 'getApplication');
+      const deployResult = (await toolHandler('deploy_application')(
+        {
+          application_uuid: 'bad',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const deleteResult = (await toolHandler('delete_application')(
+        {
+          application_uuid: 'bad',
+          expected_name: 'anything',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      expect(deployResult.content[0]!.text).toContain('not a valid Coolify resource identifier');
+      expect(deleteResult.content[0]!.text).toContain('not a valid Coolify resource identifier');
+      expect(getApplication).not.toHaveBeenCalled();
+    });
+  });
+
   describe('database tool handler', () => {
     // Regression for #217 — the database tool's create action didn't expose
     // destination_uuid, so Coolify rejected creates on servers with more than
