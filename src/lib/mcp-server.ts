@@ -4,6 +4,7 @@
  */
 
 import { createRequire } from 'module';
+import crypto from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
@@ -511,6 +512,9 @@ interface DeployApplicationToolArgs {
   application_uuid?: string;
   force_rebuild?: boolean;
   execute?: boolean;
+  expected_repository?: string;
+  expected_branch?: string;
+  expected_commit?: string;
 }
 
 interface DeleteApplicationToolArgs {
@@ -1570,6 +1574,9 @@ export class CoolifyMcpServer extends McpServer {
       {
         application_uuid: z.string(),
         force_rebuild: z.boolean().optional().default(false),
+        expected_repository: z.string().optional(),
+        expected_branch: z.string().optional(),
+        expected_commit: z.string().optional(),
         execute: z.boolean().default(false),
       },
       async (rawArgs) => {
@@ -1595,6 +1602,18 @@ export class CoolifyMcpServer extends McpServer {
           if (!isRecord(application) || application.uuid !== applicationUuid) {
             throw new Error('application_uuid could not be verified against Coolify');
           }
+          if (args.expected_repository && application.git_repository !== args.expected_repository)
+            throw new Error(
+              'TARGET_MISMATCH: expected repository differs from the exact application',
+            );
+          if (args.expected_branch && application.git_branch !== args.expected_branch)
+            throw new Error('TARGET_MISMATCH: expected branch differs from the exact application');
+          if (
+            args.expected_commit &&
+            application.git_commit_sha !== args.expected_commit &&
+            application.commit_sha !== args.expected_commit
+          )
+            throw new Error('STALE_REVISION: expected commit differs from the exact application');
           const deployments = Array.isArray(deploymentEnvelope.deployments)
             ? deploymentEnvelope.deployments.filter(isRecord)
             : [];
@@ -1611,6 +1630,17 @@ export class CoolifyMcpServer extends McpServer {
                   type: 'text' as const,
                   text: JSON.stringify(
                     {
+                      requested_target: {
+                        application_uuid: applicationUuid,
+                        expected_repository: args.expected_repository ?? null,
+                        expected_branch: args.expected_branch ?? null,
+                        expected_commit: args.expected_commit ?? null,
+                      },
+                      applied_target: null,
+                      changed: false,
+                      verified: true,
+                      warnings: [],
+                      audit_id: crypto.randomUUID(),
                       mode: 'preview',
                       execute: false,
                       ...view,
@@ -1636,12 +1666,38 @@ export class CoolifyMcpServer extends McpServer {
           if (!deploymentUuid) {
             throw new Error('Coolify returned no deployment UUID; refusing to report success');
           }
+          const postDeploymentEnvelope =
+            await this.client.listApplicationDeployments(applicationUuid);
+          const postDeployments = Array.isArray(postDeploymentEnvelope.deployments)
+            ? postDeploymentEnvelope.deployments.filter(isRecord)
+            : [];
+          const verifiedTarget = postDeployments.some(
+            (item) => String(item.deployment_uuid ?? item.uuid ?? '') === deploymentUuid,
+          );
+          if (!verifiedTarget)
+            throw new Error(
+              'POST_WRITE_VERIFICATION_FAILED: deployment UUID was not returned for the requested application',
+            );
           return {
             content: [
               {
                 type: 'text' as const,
                 text: JSON.stringify(
                   {
+                    requested_target: {
+                      application_uuid: applicationUuid,
+                      expected_repository: args.expected_repository ?? null,
+                      expected_branch: args.expected_branch ?? null,
+                      expected_commit: args.expected_commit ?? null,
+                    },
+                    applied_target: {
+                      application_uuid: applicationUuid,
+                      deployment_uuid: deploymentUuid,
+                    },
+                    changed: true,
+                    verified: true,
+                    warnings: [],
+                    audit_id: crypto.randomUUID(),
                     mode: 'execute',
                     execute: true,
                     application_uuid: applicationUuid,
@@ -2835,6 +2891,231 @@ export class CoolifyMcpServer extends McpServer {
     // =========================================================================
     // Environment Variables (1 tool - consolidated)
     // =========================================================================
+    const listEnvEntries = async (
+      resource: 'application' | 'service' | 'database',
+      uuid: string,
+    ): Promise<Record<string, unknown>[]> => {
+      const result: unknown =
+        resource === 'application'
+          ? await this.client.listApplicationEnvVars(uuid, { summary: false, reveal: true })
+          : resource === 'service'
+            ? await this.client.listServiceEnvVars(uuid, { reveal: true })
+            : await this.client.listDatabaseEnvVars(uuid);
+      return Array.isArray(result) ? result.filter(isRecord) : [];
+    };
+    const envMutation = (
+      target: Record<string, unknown>,
+      changed: boolean,
+      verified: boolean,
+      warnings: string[] = [],
+    ) => ({
+      requested_target: target,
+      applied_target: changed ? target : null,
+      changed,
+      verified,
+      warnings,
+      audit_id: crypto.randomUUID(),
+    });
+    const safeEnvEntry = (entry: Record<string, unknown>) => ({
+      entry_uuid: entry.uuid ?? null,
+      key: entry.key ?? null,
+      is_buildtime: entry.is_buildtime ?? null,
+      is_runtime: entry.is_runtime ?? null,
+      has_value: Boolean(entry.value || entry.real_value),
+      secret_redacted: true,
+    });
+    this.tool(
+      'inspect_env',
+      'Inspect only an explicit bounded key list for one exact Coolify resource UUID. Values are always redacted; duplicate and effective-entry metadata is retained.',
+      {
+        resource: z.enum(['application', 'service', 'database']),
+        uuid: z.string(),
+        keys: z.array(z.string().min(1)).min(1).max(100),
+      },
+      async ({ resource, uuid, keys }) =>
+        wrap(async () => {
+          if (!isSafeCoolifyResourceId(uuid))
+            throw new Error('TARGET_MISMATCH: uuid must be an exact Coolify resource identifier');
+          const requestedKeys = [...new Set(keys)];
+          const all = await listEnvEntries(resource, uuid);
+          const selected = all.filter((entry) => requestedKeys.includes(String(entry.key)));
+          const byKey = new Map<string, Record<string, unknown>[]>();
+          for (const entry of selected) {
+            const key = String(entry.key);
+            byKey.set(key, [...(byKey.get(key) ?? []), entry]);
+          }
+          const entries = requestedKeys.map((key) => {
+            const matches = byKey.get(key) ?? [];
+            const flagPairs = new Set(
+              matches.map((entry) => `${Boolean(entry.is_buildtime)}:${Boolean(entry.is_runtime)}`),
+            );
+            return {
+              key,
+              entries: matches.map(safeEnvEntry),
+              duplicate_count: Math.max(0, matches.length - 1),
+              conflicting_flags: flagPairs.size > 1,
+              effective_entry_uuid: matches.length
+                ? (matches[matches.length - 1].uuid ?? null)
+                : null,
+              effective_value_redacted: true,
+            };
+          });
+          return {
+            resource,
+            uuid,
+            requested_keys: requestedKeys,
+            entries,
+            unrelated_entries_returned: 0,
+            secret_redacted: true,
+          };
+        }),
+    );
+    this.tool(
+      'reconcile_env',
+      'Preview-first exact-key environment reconciliation. Only requested keys may be created, updated, or deduplicated; plaintext values are never returned.',
+      {
+        resource: z.enum(['application', 'service', 'database']),
+        uuid: z.string(),
+        keys: z.array(z.string().min(1)).min(1).max(100),
+        desired_values: z.record(z.string(), z.string()).optional(),
+        server_side_secret_refs: z.record(z.string(), z.string()).optional(),
+        apply: z.boolean().optional().default(false),
+      },
+      async ({ resource, uuid, keys, desired_values, server_side_secret_refs, apply }) =>
+        wrap(async () => {
+          if (!isSafeCoolifyResourceId(uuid))
+            throw new Error('TARGET_MISMATCH: uuid must be an exact Coolify resource identifier');
+          const requestedKeys = [...new Set(keys)];
+          const desired = { ...(desired_values ?? {}) };
+          for (const [key, reference] of Object.entries(server_side_secret_refs ?? {}))
+            desired[key] = reference;
+          for (const key of Object.keys(desired))
+            if (!requestedKeys.includes(key))
+              throw new Error(`TARGET_MISMATCH: desired value supplied for unrequested key ${key}`);
+          const all = await listEnvEntries(resource, uuid);
+          const byKey = new Map<string, Record<string, unknown>[]>();
+          for (const entry of all)
+            if (requestedKeys.includes(String(entry.key)))
+              byKey.set(String(entry.key), [...(byKey.get(String(entry.key)) ?? []), entry]);
+          const retained: Record<string, unknown>[] = [],
+            created: string[] = [],
+            updated: string[] = [],
+            deleted: string[] = [],
+            warnings: string[] = [];
+          for (const key of requestedKeys) {
+            const matches = byKey.get(key) ?? [];
+            const canonical = matches[matches.length - 1];
+            if (!canonical) {
+              if (desired[key] === undefined)
+                warnings.push(`no value supplied for missing key ${key}`);
+              else created.push(key);
+            } else {
+              retained.push(safeEnvEntry(canonical));
+              if (
+                desired[key] !== undefined &&
+                desired[key] !== canonical.value &&
+                desired[key] !== canonical.real_value
+              )
+                updated.push(key);
+              for (const duplicate of matches.slice(0, -1))
+                if (duplicate.uuid) deleted.push(String(duplicate.uuid));
+            }
+          }
+          const target = { resource, uuid, keys: requestedKeys };
+          if (!apply)
+            return {
+              ok: true,
+              ...envMutation(target, false, true, warnings),
+              preview_only: true,
+              retained,
+              created,
+              updated,
+              deleted,
+              note: 'No changes were made. Re-run with apply=true.',
+            };
+          const methods = {
+            application: {
+              create: (key: string, value: string, entry?: Record<string, unknown>) =>
+                entry
+                  ? this.client.updateApplicationEnvVar(uuid, {
+                      key,
+                      value,
+                      is_buildtime: Boolean(entry.is_buildtime),
+                      is_runtime: Boolean(entry.is_runtime),
+                    })
+                  : this.client.createApplicationEnvVar(uuid, { key, value }),
+              delete: (entryUuid: string) => this.client.deleteApplicationEnvVar(uuid, entryUuid),
+            },
+            service: {
+              create: (key: string, value: string, entry?: Record<string, unknown>) =>
+                entry
+                  ? this.client.updateServiceEnvVar(uuid, {
+                      key,
+                      value,
+                      is_buildtime: Boolean(entry.is_buildtime),
+                      is_runtime: Boolean(entry.is_runtime),
+                    })
+                  : this.client.createServiceEnvVar(uuid, { key, value }),
+              delete: (entryUuid: string) => this.client.deleteServiceEnvVar(uuid, entryUuid),
+            },
+            database: {
+              create: (key: string, value: string, entry?: Record<string, unknown>) =>
+                entry
+                  ? this.client.updateDatabaseEnvVar(uuid, {
+                      key,
+                      value,
+                      is_buildtime: Boolean(entry.is_buildtime),
+                      is_runtime: Boolean(entry.is_runtime),
+                    })
+                  : this.client.createDatabaseEnvVar(uuid, { key, value }),
+              delete: (entryUuid: string) => this.client.deleteDatabaseEnvVar(uuid, entryUuid),
+            },
+          }[resource];
+          for (const key of requestedKeys) {
+            const matches = byKey.get(key) ?? [];
+            const canonical = matches[matches.length - 1];
+            if (desired[key] !== undefined) await methods.create(key, desired[key], canonical);
+            for (const duplicate of matches.slice(0, -1))
+              if (duplicate.uuid) await methods.delete(String(duplicate.uuid));
+          }
+          const finalEntries = await listEnvEntries(resource, uuid);
+          const remaining = finalEntries.filter((entry) =>
+            requestedKeys.includes(String(entry.key)),
+          );
+          const verificationMismatches: Array<Record<string, unknown>> = [];
+          for (const key of requestedKeys) {
+            const matches = remaining.filter((entry) => String(entry.key) === key);
+            if (matches.length !== 1) {
+              verificationMismatches.push({
+                key,
+                reason: 'canonical_entry_count',
+                actual: matches.length,
+              });
+              continue;
+            }
+            if (
+              desired[key] !== undefined &&
+              desired[key] !== matches[0].value &&
+              desired[key] !== matches[0].real_value
+            ) {
+              verificationMismatches.push({ key, reason: 'desired_value', actual: '[REDACTED]' });
+            }
+          }
+          if (verificationMismatches.length > 0)
+            throw new Error(
+              `POST_WRITE_VERIFICATION_FAILED: ${JSON.stringify(verificationMismatches)}`,
+            );
+          return {
+            ok: true,
+            ...envMutation(target, true, true, warnings),
+            preview_only: false,
+            retained: remaining.map(safeEnvEntry),
+            created,
+            updated,
+            deleted,
+          };
+        }),
+    );
     this.tool(
       'env_vars',
       "Manage env vars for app, service, or database. Values are masked by default (returned as '***') to avoid leaking secrets to MCP clients; pass reveal=true on the list action when the caller explicitly needs the plaintext (e.g. 'what is FOO set to?'). Set is_buildtime=false (and/or is_runtime=true) for runtime-only vars to avoid Dockerfile ARG issues with multiline values like PEM keys.",

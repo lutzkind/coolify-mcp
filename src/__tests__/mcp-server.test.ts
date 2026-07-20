@@ -373,6 +373,75 @@ describe('CoolifyMcpServer v2', () => {
     });
   });
 
+  describe('guarded environment tools', () => {
+    const call = async (
+      name: string,
+      args: Record<string, unknown>,
+    ): Promise<{ content: Array<{ text: string }> }> => {
+      const tool = (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools[name];
+      return (await tool.handler(args, {})) as { content: Array<{ text: string }> };
+    };
+
+    it('inspect_env returns only requested keys and redacts values', async () => {
+      jest.spyOn(server['client'], 'listApplicationEnvVars').mockResolvedValue([
+        {
+          uuid: 'env-1',
+          key: 'REQUESTED',
+          value: 'secret-value',
+          is_buildtime: false,
+          is_runtime: true,
+        },
+        {
+          uuid: 'env-2',
+          key: 'UNREQUESTED',
+          value: 'unrelated',
+          is_buildtime: false,
+          is_runtime: true,
+        },
+      ] as never);
+      const result = await call('inspect_env', {
+        resource: 'application',
+        uuid: 'abcdefghijklmnopqrstuvwx',
+        keys: ['REQUESTED'],
+      });
+      const body = JSON.parse(result.content[0].text);
+      expect(body.entries).toHaveLength(1);
+      expect(body.entries[0].entries[0].key).toBe('REQUESTED');
+      expect(JSON.stringify(body)).not.toContain('secret-value');
+      expect(JSON.stringify(body)).not.toContain('UNREQUESTED');
+    });
+
+    it('reconcile_env previews without invoking a mutation', async () => {
+      const list = jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValue([
+          { uuid: 'env-1', key: 'REQUESTED', value: 'old', is_buildtime: false, is_runtime: true },
+        ] as never);
+      const update = jest.spyOn(server['client'], 'updateApplicationEnvVar');
+      const result = await call('reconcile_env', {
+        resource: 'application',
+        uuid: 'abcdefghijklmnopqrstuvwx',
+        keys: ['REQUESTED'],
+        desired_values: { REQUESTED: 'new' },
+      });
+      const body = JSON.parse(result.content[0].text);
+      expect(body.preview_only).toBe(true);
+      expect(body.updated).toEqual(['REQUESTED']);
+      expect(update).not.toHaveBeenCalled();
+      expect(list).toHaveBeenCalledWith('abcdefghijklmnopqrstuvwx', {
+        summary: false,
+        reveal: true,
+      });
+    });
+  });
+
   describe('system tool handler', () => {
     const callSystem = async (
       srv: CoolifyMcpServer,
@@ -1273,7 +1342,11 @@ describe('CoolifyMcpServer v2', () => {
       expect(blocked.content[0]!.text).toContain('active deployment exists');
       expect(trigger).not.toHaveBeenCalled();
 
-      deployments.mockResolvedValue({ count: 0, deployments: [] });
+      deployments.mockResolvedValueOnce({ count: 0, deployments: [] });
+      deployments.mockResolvedValueOnce({
+        count: 1,
+        deployments: [{ deployment_uuid: 'new-deployment', status: 'queued' }],
+      } as never);
       const executed = (await toolHandler('deploy_application')(
         {
           application_uuid: ids.application_uuid,
