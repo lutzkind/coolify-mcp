@@ -4,6 +4,7 @@
  */
 
 import { createRequire } from 'module';
+import crypto from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
@@ -24,6 +25,7 @@ import type {
   CoolifyConfig,
   GitHubApp,
   BuildPack,
+  Database,
   ResponseAction,
   ResponsePagination,
   Deployment,
@@ -34,6 +36,7 @@ const _require = createRequire(import.meta.url);
 export const VERSION: string = _require('../../package.json').version;
 
 const CREATE_APPLICATION_ENDPOINT = '/api/v1/applications/public';
+const CREATE_APPLICATION_PRIVATE_KEY_ENDPOINT = '/api/v1/applications/private-deploy-key';
 const COOLIFY_RESOURCE_ID =
   /^(?:[a-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const CREATE_APPLICATION_BUILD_PACKS = [
@@ -43,6 +46,8 @@ const CREATE_APPLICATION_BUILD_PACKS = [
   'dockerfile',
   'dockercompose',
 ] as const;
+const DEFAULT_APPLICATION_PAGE_SIZE = 50;
+const MAX_APPLICATION_PAGE_SIZE = 100;
 
 interface CreateApplicationToolArgs {
   name?: string;
@@ -52,6 +57,8 @@ interface CreateApplicationToolArgs {
   project_uuid?: string;
   environment_uuid?: string;
   environment_name?: string;
+  destination_uuid?: string;
+  private_key_uuid?: string;
   build_pack?: string;
   build_type?: string;
   dockerfile_location?: string;
@@ -64,6 +71,50 @@ interface CreateApplicationToolArgs {
 
 function isSafeCoolifyResourceId(value: string): boolean {
   return COOLIFY_RESOURCE_ID.test(value.trim());
+}
+
+export function normalizeApplicationPagination(
+  page?: number,
+  perPage?: number,
+): {
+  page: number;
+  per_page: number;
+} {
+  const normalizedPage = Number.isFinite(page) ? Math.max(1, Math.floor(page!)) : 1;
+  const normalizedPerPage = Number.isFinite(perPage)
+    ? Math.min(MAX_APPLICATION_PAGE_SIZE, Math.max(1, Math.floor(perPage!)))
+    : DEFAULT_APPLICATION_PAGE_SIZE;
+  return { page: normalizedPage, per_page: normalizedPerPage };
+}
+
+function isNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:\b404\b|not found|could not be found)/i.test(message);
+}
+
+async function verifyApplicationDeleted(
+  client: CoolifyClient,
+  applicationUuid: string,
+): Promise<Record<string, unknown>> {
+  try {
+    await client.getApplication(applicationUuid);
+    return {
+      ok: false,
+      status: 'still_exists',
+      exists: true,
+      message: 'Coolify still returned the application after deletion.',
+    };
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return { ok: true, status: 'not_found', exists: false };
+    }
+    return {
+      ok: false,
+      status: 'readback_error',
+      exists: null,
+      error: client.sanitizeError(error),
+    };
+  }
 }
 
 function hasControlCharacter(value: string): boolean {
@@ -107,6 +158,8 @@ export function validateCreateApplicationInput(args: CreateApplicationToolArgs):
   }
   const environmentUuid = args.environment_uuid?.trim();
   const environmentName = args.environment_name?.trim();
+  const destinationUuid = args.destination_uuid?.trim();
+  const privateKeyUuid = args.private_key_uuid?.trim();
   if (args.environment_uuid !== undefined && !environmentUuid) {
     errors.push('environment_uuid must not be blank');
   }
@@ -120,6 +173,18 @@ export function validateCreateApplicationInput(args: CreateApplicationToolArgs):
   }
   if (environmentUuid && !isSafeCoolifyResourceId(environmentUuid)) {
     errors.push('environment_uuid is not a valid Coolify resource identifier');
+  }
+  if (args.destination_uuid !== undefined && !destinationUuid) {
+    errors.push('destination_uuid must not be blank');
+  }
+  if (destinationUuid && !isSafeCoolifyResourceId(destinationUuid)) {
+    errors.push('destination_uuid is not a valid Coolify resource identifier');
+  }
+  if (args.private_key_uuid !== undefined && !privateKeyUuid) {
+    errors.push('private_key_uuid must not be blank');
+  }
+  if (privateKeyUuid && !isSafeCoolifyResourceId(privateKeyUuid)) {
+    errors.push('private_key_uuid is not a valid Coolify resource identifier');
   }
   for (const field of ['name', 'git_repository', 'git_branch'] as const) {
     if (!args[field]?.trim()) errors.push(`${field} is required`);
@@ -197,12 +262,16 @@ function createApplicationPayload(args: CreateApplicationToolArgs): Record<strin
   const buildPack = (args.build_pack ?? args.build_type)!.trim();
   const environmentUuid = args.environment_uuid?.trim();
   const environmentName = args.environment_name?.trim();
+  const destinationUuid = args.destination_uuid?.trim();
+  const privateKeyUuid = args.private_key_uuid?.trim();
   return {
     project_uuid: args.project_uuid!.trim(),
     server_uuid: args.server_uuid!.trim(),
     ...(environmentUuid
       ? { environment_uuid: environmentUuid }
       : { environment_name: environmentName }),
+    ...(destinationUuid ? { destination_uuid: destinationUuid } : {}),
+    ...(privateKeyUuid ? { private_key_uuid: privateKeyUuid } : {}),
     name: args.name!.trim(),
     git_repository: args.git_repository!.trim(),
     git_branch: args.git_branch!.trim(),
@@ -219,6 +288,187 @@ function createApplicationPayload(args: CreateApplicationToolArgs): Record<strin
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+const PROVISION_POSTGRES_DATA_MOUNT = '/var/lib/postgresql/data';
+const PROVISION_POSTGRES_DEFAULT_VERSION = '16';
+const PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE = '10Gi';
+const PROVISION_POSTGRES_READY_TIMEOUT_MS = 30_000;
+const PROVISION_POSTGRES_POLL_INTERVAL_MS = 1_000;
+
+export interface ProvisionApplicationPostgresToolArgs {
+  application_uuid?: string;
+  project_uuid?: string;
+  environment_uuid?: string;
+  environment_name?: string;
+  server_uuid?: string;
+  destination_uuid?: string;
+  database_name?: string;
+  environment_variable_key?: string;
+  postgres_version?: string;
+  storage_size?: string;
+  dry_run?: boolean;
+  apply?: boolean;
+  redeploy_application?: boolean;
+}
+
+export function validateProvisionApplicationPostgresInput(
+  args: ProvisionApplicationPostgresToolArgs,
+): string[] {
+  const errors: string[] = [];
+  for (const field of [
+    'application_uuid',
+    'project_uuid',
+    'server_uuid',
+    'destination_uuid',
+  ] as const) {
+    const value = args[field]?.trim();
+    if (!value) errors.push(`${field} is required`);
+    else if (!isSafeCoolifyResourceId(value)) {
+      errors.push(`${field} is not a valid Coolify resource identifier`);
+    }
+  }
+
+  const environmentUuid = args.environment_uuid?.trim();
+  const environmentName = args.environment_name?.trim();
+  if (args.environment_uuid !== undefined && !environmentUuid) {
+    errors.push('environment_uuid must not be blank');
+  }
+  if (args.environment_name !== undefined && !environmentName) {
+    errors.push('environment_name must not be blank');
+  }
+  if (!environmentUuid && !environmentName) {
+    errors.push('exactly one of environment_uuid or environment_name is required');
+  } else if (environmentUuid && environmentName) {
+    errors.push('environment_uuid and environment_name are mutually exclusive');
+  }
+  if (environmentUuid && !isSafeCoolifyResourceId(environmentUuid)) {
+    errors.push('environment_uuid is not a valid Coolify resource identifier');
+  }
+
+  const databaseName = args.database_name?.trim();
+  if (!databaseName) errors.push('database_name is required');
+  else if (!/^[a-z][a-z0-9_]{0,62}$/.test(databaseName)) {
+    errors.push(
+      'database_name must start with a lowercase letter and contain only lowercase letters, numbers, and underscores',
+    );
+  }
+
+  const variableKey = args.environment_variable_key?.trim();
+  if (!variableKey) errors.push('environment_variable_key is required');
+  else if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(variableKey)) {
+    errors.push('environment_variable_key must be a valid environment-variable key');
+  }
+
+  const postgresVersion = args.postgres_version?.trim() || PROVISION_POSTGRES_DEFAULT_VERSION;
+  if (!/^\d+(?:\.\d+)?$/.test(postgresVersion)) {
+    errors.push('postgres_version must contain only a PostgreSQL version number');
+  }
+
+  const storageSize = args.storage_size?.trim() || PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE;
+  if (!/^\d+(?:Mi|Gi|Ti)$/.test(storageSize)) {
+    errors.push('storage_size must use a positive value with Mi, Gi, or Ti');
+  }
+
+  const dryRun = args.dry_run ?? true;
+  const apply = args.apply ?? false;
+  if (dryRun && apply) errors.push('dry_run and apply cannot both be true');
+  if (!dryRun && !apply) errors.push('apply=true is required when dry_run=false');
+  if (args.redeploy_application === true && !apply) {
+    errors.push('redeploy_application requires apply=true');
+  }
+  return errors;
+}
+
+function stringProperty(value: unknown, key: string): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const result = value[key];
+  return typeof result === 'string' ? result : undefined;
+}
+
+function nestedRecord(value: unknown, key: string): Record<string, unknown> | undefined {
+  if (!isRecord(value) || !isRecord(value[key])) return undefined;
+  return value[key] as Record<string, unknown>;
+}
+
+function destinationUuidOf(resource: unknown): string | undefined {
+  const direct = stringProperty(resource, 'destination_uuid');
+  const nested = stringProperty(nestedRecord(resource, 'destination'), 'uuid');
+  return direct ?? nested;
+}
+
+function destinationServerUuidOf(resource: unknown): string | undefined {
+  const destination = nestedRecord(resource, 'destination');
+  return (
+    stringProperty(destination, 'server_uuid') ??
+    stringProperty(nestedRecord(destination, 'server'), 'uuid') ??
+    stringProperty(resource, 'server_uuid')
+  );
+}
+
+function environmentIdOf(resource: unknown): number | undefined {
+  if (!isRecord(resource) || typeof resource.environment_id !== 'number') return undefined;
+  return resource.environment_id;
+}
+
+function databaseTypeOf(database: unknown): string {
+  return (
+    stringProperty(database, 'type') ??
+    stringProperty(database, 'database_type') ??
+    ''
+  ).toLowerCase();
+}
+
+function databaseIsReady(database: unknown): boolean {
+  const status = stringProperty(database, 'status')?.toLowerCase() ?? '';
+  return (
+    (status.includes('running') || status.includes('healthy')) &&
+    !status.includes('unhealthy') &&
+    !status.includes('error') &&
+    !status.includes('exited')
+  );
+}
+
+function safeProvisionDatabaseStatus(database: unknown): string {
+  return stringProperty(database, 'status') ?? 'unknown';
+}
+
+function internalPostgresUrl(database: Database): string {
+  if (typeof database.internal_db_url === 'string' && database.internal_db_url.length > 0) {
+    return database.internal_db_url;
+  }
+  if (
+    !database.uuid ||
+    !database.postgres_user ||
+    !database.postgres_password ||
+    !database.postgres_db
+  ) {
+    throw new Error('Coolify did not return the generated PostgreSQL connection metadata');
+  }
+  return `postgresql://${encodeURIComponent(database.postgres_user)}:${encodeURIComponent(database.postgres_password)}@${database.uuid}:5432/${encodeURIComponent(database.postgres_db)}`;
+}
+
+async function waitForPostgresReady(client: CoolifyClient, uuid: string): Promise<Database> {
+  const deadline = Date.now() + PROVISION_POSTGRES_READY_TIMEOUT_MS;
+  let last: Database | undefined;
+  while (Date.now() <= deadline) {
+    last = await client.getDatabase(uuid);
+    if (databaseIsReady(last)) return last;
+    const status = safeProvisionDatabaseStatus(last).toLowerCase();
+    if (status.includes('error') || status.includes('failed') || status.includes('exited')) {
+      throw new Error(
+        `managed PostgreSQL database did not become ready (status: ${safeProvisionDatabaseStatus(last)})`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, PROVISION_POSTGRES_POLL_INTERVAL_MS));
+  }
+  throw new Error(
+    `managed PostgreSQL database readiness timed out (last status: ${safeProvisionDatabaseStatus(last)})`,
+  );
+}
+
+function provisionError(client: CoolifyClient, error: unknown, secrets: string[]): string {
+  return redactSensitiveText(client.sanitizeError(error), secrets);
 }
 
 /** Wrap handler with error handling */
@@ -302,6 +552,121 @@ interface ApplicationMutationPreflight {
   reason?: string;
   current_status?: string;
   active_deployments: number;
+}
+
+interface DeployApplicationToolArgs {
+  application_uuid?: string;
+  force_rebuild?: boolean;
+  execute?: boolean;
+  expected_repository?: string;
+  expected_branch?: string;
+  expected_commit?: string;
+}
+
+interface DeleteApplicationToolArgs {
+  application_uuid?: string;
+  expected_name?: string;
+  execute?: boolean;
+}
+
+const ACTIVE_DEPLOYMENT_STATUSES = new Set([
+  'queued',
+  'in_progress',
+  'running',
+  'building',
+  'deploying',
+  'pending',
+  'waiting',
+]);
+
+function validateApplicationUuid(value: string | undefined): string[] {
+  const trimmed = value?.trim();
+  if (!trimmed) return ['application_uuid is required'];
+  if (!isSafeCoolifyResourceId(trimmed)) {
+    return ['application_uuid is not a valid Coolify resource identifier'];
+  }
+  return [];
+}
+
+function validateDeployApplicationInput(args: DeployApplicationToolArgs): string[] {
+  return validateApplicationUuid(args.application_uuid);
+}
+
+function validateDeleteApplicationInput(args: DeleteApplicationToolArgs): string[] {
+  return [
+    ...validateApplicationUuid(args.application_uuid),
+    ...(args.expected_name?.trim() ? [] : ['expected_name must not be blank']),
+  ];
+}
+
+function activeDeployments(deployments: unknown[]): SafeDeploymentRead[] {
+  return deployments
+    .filter(isRecord)
+    .filter((deployment) =>
+      ACTIVE_DEPLOYMENT_STATUSES.has(String(deployment.status ?? '').toLowerCase()),
+    )
+    .map((deployment) => summarizeDeploymentForRead(deployment));
+}
+
+function safePrivateKeyMetadata(
+  rawKey: unknown,
+  applications?: Record<string, unknown>[],
+): Record<string, unknown> {
+  const key = isRecord(rawKey) ? rawKey : {};
+  const keyId = key.id;
+  const keyUuid = typeof key.uuid === 'string' ? key.uuid : undefined;
+  const usedBy = applications?.filter((application) => {
+    const privateKeyUuid = application.private_key_uuid;
+    const privateKeyId = application.private_key_id;
+    return (
+      (keyUuid !== undefined && privateKeyUuid === keyUuid) ||
+      (typeof keyId === 'number' && privateKeyId === keyId)
+    );
+  });
+  return {
+    uuid: key.uuid,
+    name: key.name,
+    ...(key.description !== undefined ? { description: key.description } : {}),
+    ...(key.created_at !== undefined ? { created_at: key.created_at } : {}),
+    ...(key.updated_at !== undefined ? { updated_at: key.updated_at } : {}),
+    ...(key.is_git_related !== undefined ? { is_git_related: key.is_git_related } : {}),
+    ...(usedBy
+      ? {
+          used_by_applications: usedBy.length > 0,
+          used_by_application_count: usedBy.length,
+        }
+      : {}),
+    secrets_redacted: true,
+  };
+}
+
+function safeApplicationLifecycleView(
+  application: Record<string, unknown>,
+  deployments: unknown[],
+): Record<string, unknown> {
+  return {
+    application_uuid: application.uuid,
+    name: application.name,
+    repository: application.git_repository,
+    branch: application.git_branch,
+    domain: application.fqdn ?? application.domains ?? null,
+    status: application.status ?? null,
+    active_deployments: activeDeployments(deployments),
+  };
+}
+
+function deploymentUuidFromTrigger(response: unknown): string | undefined {
+  if (!isRecord(response)) return undefined;
+  const direct = response.deployment_uuid ?? response.uuid;
+  if (typeof direct === 'string' && direct.trim()) return direct;
+  if (Array.isArray(response.deployments)) {
+    for (const deployment of response.deployments) {
+      if (!isRecord(deployment)) continue;
+      const uuid = deployment.deployment_uuid ?? deployment.uuid;
+      if (typeof uuid === 'string' && uuid.trim()) return uuid;
+    }
+  }
+  return undefined;
 }
 
 interface SafeDeploymentRead {
@@ -986,13 +1351,59 @@ export class CoolifyMcpServer extends McpServer {
       'list_applications',
       'List apps (summary)',
       { page: z.number().optional(), per_page: z.number().optional() },
-      async ({ page, per_page }) =>
-        wrapWithActions(
-          () => this.client.listApplications({ page, per_page, summary: true }),
-          undefined,
-          (result) =>
-            getPagination('list_applications', page, per_page, (result as unknown[]).length),
-        ),
+      async ({ page, per_page }) => {
+        const pagination = normalizeApplicationPagination(page, per_page);
+        try {
+          // Coolify deployments have returned the complete collection while
+          // still advertising pagination headers. Slice locally so the MCP
+          // contract is deterministic even when the upstream ignores query
+          // parameters, and derive next/prev from the complete bounded set.
+          const listed = await this.client.listApplications({ summary: true });
+          const applications = Array.isArray(listed) ? listed : [];
+          const start = (pagination.page - 1) * pagination.per_page;
+          const data = applications.slice(start, start + pagination.per_page);
+          const hasNext = start + data.length < applications.length;
+          const response: Record<string, unknown> = {
+            data,
+            pagination: {
+              page: pagination.page,
+              per_page: pagination.per_page,
+              total: applications.length,
+              has_next: hasNext,
+            },
+          };
+          if (pagination.page > 1) {
+            response._pagination = {
+              prev: {
+                tool: 'list_applications',
+                args: { page: pagination.page - 1, per_page: pagination.per_page },
+              },
+              ...(hasNext
+                ? {
+                    next: {
+                      tool: 'list_applications',
+                      args: { page: pagination.page + 1, per_page: pagination.per_page },
+                    },
+                  }
+                : {}),
+            };
+          } else if (hasNext) {
+            response._pagination = {
+              next: {
+                tool: 'list_applications',
+                args: { page: pagination.page + 1, per_page: pagination.per_page },
+              },
+            };
+          }
+          return { content: [{ type: 'text' as const, text: JSON.stringify(response, null, 2) }] };
+        } catch (error) {
+          return {
+            content: [
+              { type: 'text' as const, text: `Error: ${this.client.sanitizeError(error)}` },
+            ],
+          };
+        }
+      },
     );
 
     this.tool(
@@ -1024,6 +1435,8 @@ export class CoolifyMcpServer extends McpServer {
         project_uuid: z.string(),
         environment_uuid: z.string().optional(),
         environment_name: z.string().optional(),
+        destination_uuid: z.string().optional(),
+        private_key_uuid: z.string().optional(),
         build_pack: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
         build_type: z.enum(CREATE_APPLICATION_BUILD_PACKS).optional(),
         dockerfile_location: z.string().optional(),
@@ -1053,6 +1466,9 @@ export class CoolifyMcpServer extends McpServer {
         }
 
         const payload = createApplicationPayload(args);
+        const endpoint = args.private_key_uuid?.trim()
+          ? CREATE_APPLICATION_PRIVATE_KEY_ENDPOINT
+          : CREATE_APPLICATION_ENDPOINT;
         if (args.execute !== true) {
           return {
             content: [
@@ -1065,7 +1481,7 @@ export class CoolifyMcpServer extends McpServer {
                     created: false,
                     deployed: false,
                     message: 'Preview only: no Coolify application was created.',
-                    endpoint: CREATE_APPLICATION_ENDPOINT,
+                    endpoint,
                     payload,
                   },
                   null,
@@ -1108,6 +1524,13 @@ export class CoolifyMcpServer extends McpServer {
                 : 'environment_name was not found in the requested project',
             );
           }
+
+          if (args.private_key_uuid?.trim()) {
+            const privateKey = await this.client.getPrivateKey(args.private_key_uuid.trim());
+            if (!isRecord(privateKey) || privateKey.uuid !== args.private_key_uuid.trim()) {
+              throw new Error('private_key_uuid could not be verified against Coolify');
+            }
+          }
           if (
             typeof environment.project_uuid === 'string' &&
             environment.project_uuid !== args.project_uuid!.trim()
@@ -1136,7 +1559,9 @@ export class CoolifyMcpServer extends McpServer {
             );
           }
 
-          const created = await this.client.createApplicationPublic(payload as any);
+          const created = args.private_key_uuid?.trim()
+            ? await this.client.createApplicationPrivateKey(payload as any)
+            : await this.client.createApplicationPublic(payload as any);
           if (
             !isRecord(created) ||
             typeof created.uuid !== 'string' ||
@@ -1165,7 +1590,7 @@ export class CoolifyMcpServer extends McpServer {
                     created: true,
                     deployed: false,
                     message: 'Application created. No deployment was requested or started.',
-                    endpoint: CREATE_APPLICATION_ENDPOINT,
+                    endpoint,
                     application: safeApplication,
                   },
                   null,
@@ -1180,6 +1605,690 @@ export class CoolifyMcpServer extends McpServer {
               {
                 type: 'text' as const,
                 text: `Error: create_application refused or failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.tool(
+      'list_private_keys',
+      'List existing Coolify private keys as safe metadata only; key material is never returned.',
+      {},
+      async () => {
+        try {
+          const [keysResult, applicationsResult] = await Promise.allSettled([
+            this.client.listPrivateKeys(),
+            this.client.listApplications(),
+          ]);
+          if (keysResult.status === 'rejected') throw keysResult.reason;
+          const keys = Array.isArray(keysResult.value) ? keysResult.value : [];
+          const applications =
+            applicationsResult.status === 'fulfilled' && Array.isArray(applicationsResult.value)
+              ? applicationsResult.value.map(
+                  (application) => application as unknown as Record<string, unknown>,
+                )
+              : undefined;
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    keys: keys
+                      .filter(isRecord)
+                      .map((key) => safePrivateKeyMetadata(key, applications)),
+                    secrets_redacted: true,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: list_private_keys failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.tool(
+      'deploy_application',
+      'Preview or explicitly deploy exactly one existing application. Preview is the default and active deployments block duplicates.',
+      {
+        application_uuid: z.string(),
+        force_rebuild: z.boolean().optional().default(false),
+        expected_repository: z.string().optional(),
+        expected_branch: z.string().optional(),
+        expected_commit: z.string().optional(),
+        execute: z.boolean().default(false),
+      },
+      async (rawArgs) => {
+        const args = rawArgs as DeployApplicationToolArgs;
+        const validationErrors = validateDeployApplicationInput(args);
+        if (validationErrors.length > 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: deploy_application refused: ${validationErrors.join('; ')}`,
+              },
+            ],
+          };
+        }
+        const applicationUuid = args.application_uuid!.trim();
+        const forceRebuild = args.force_rebuild ?? false;
+        try {
+          const [application, deploymentEnvelope] = await Promise.all([
+            this.client.getApplication(applicationUuid),
+            this.client.listApplicationDeployments(applicationUuid),
+          ]);
+          if (!isRecord(application) || application.uuid !== applicationUuid) {
+            throw new Error('application_uuid could not be verified against Coolify');
+          }
+          if (args.expected_repository && application.git_repository !== args.expected_repository)
+            throw new Error(
+              'TARGET_MISMATCH: expected repository differs from the exact application',
+            );
+          if (args.expected_branch && application.git_branch !== args.expected_branch)
+            throw new Error('TARGET_MISMATCH: expected branch differs from the exact application');
+          if (
+            args.expected_commit &&
+            application.git_commit_sha !== args.expected_commit &&
+            application.commit_sha !== args.expected_commit
+          )
+            throw new Error('STALE_REVISION: expected commit differs from the exact application');
+          const deployments = Array.isArray(deploymentEnvelope.deployments)
+            ? deploymentEnvelope.deployments.filter(isRecord)
+            : [];
+          const active = activeDeployments(deployments);
+          const view = safeApplicationLifecycleView(application, deployments);
+          const request = {
+            method: 'GET',
+            endpoint: `/api/v1/deploy?uuid=${encodeURIComponent(applicationUuid)}&force=${forceRebuild}`,
+          };
+          if (args.execute !== true) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    {
+                      requested_target: {
+                        application_uuid: applicationUuid,
+                        expected_repository: args.expected_repository ?? null,
+                        expected_branch: args.expected_branch ?? null,
+                        expected_commit: args.expected_commit ?? null,
+                      },
+                      applied_target: null,
+                      changed: false,
+                      verified: true,
+                      warnings: [],
+                      audit_id: crypto.randomUUID(),
+                      mode: 'preview',
+                      execute: false,
+                      ...view,
+                      active_deployments: active,
+                      deployment_request: request,
+                      deployment_started: false,
+                      message: 'Preview only: no deployment was started.',
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
+          if (active.length > 0) {
+            throw new Error(
+              `active deployment exists for application ${applicationUuid}; refusing duplicate deployment`,
+            );
+          }
+          const trigger = await this.client.deployByTagOrUuid(applicationUuid, forceRebuild);
+          const deploymentUuid = deploymentUuidFromTrigger(trigger);
+          if (!deploymentUuid) {
+            throw new Error('Coolify returned no deployment UUID; refusing to report success');
+          }
+          const postDeploymentEnvelope =
+            await this.client.listApplicationDeployments(applicationUuid);
+          const postDeployments = Array.isArray(postDeploymentEnvelope.deployments)
+            ? postDeploymentEnvelope.deployments.filter(isRecord)
+            : [];
+          const verifiedTarget = postDeployments.some(
+            (item) => String(item.deployment_uuid ?? item.uuid ?? '') === deploymentUuid,
+          );
+          if (!verifiedTarget)
+            throw new Error(
+              'POST_WRITE_VERIFICATION_FAILED: deployment UUID was not returned for the requested application',
+            );
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    requested_target: {
+                      application_uuid: applicationUuid,
+                      expected_repository: args.expected_repository ?? null,
+                      expected_branch: args.expected_branch ?? null,
+                      expected_commit: args.expected_commit ?? null,
+                    },
+                    applied_target: {
+                      application_uuid: applicationUuid,
+                      deployment_uuid: deploymentUuid,
+                    },
+                    changed: true,
+                    verified: true,
+                    warnings: [],
+                    audit_id: crypto.randomUUID(),
+                    mode: 'execute',
+                    execute: true,
+                    application_uuid: applicationUuid,
+                    deployment_uuid: deploymentUuid,
+                    force_rebuild: forceRebuild,
+                    deployment_started: true,
+                    operation_status: 'triggered',
+                    active_deployments_before_request: 0,
+                    message:
+                      'Exactly one deployment request was sent; no retry or wait was performed.',
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: deploy_application refused or failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.tool(
+      'delete_application',
+      'Preview or explicitly delete exactly one existing application after an exact name check. Preview is the default and active deployments block deletion.',
+      {
+        application_uuid: z.string(),
+        expected_name: z.string(),
+        execute: z.boolean().default(false),
+      },
+      async (rawArgs) => {
+        const args = rawArgs as DeleteApplicationToolArgs;
+        const validationErrors = validateDeleteApplicationInput(args);
+        if (validationErrors.length > 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: delete_application refused: ${validationErrors.join('; ')}`,
+              },
+            ],
+          };
+        }
+        const applicationUuid = args.application_uuid!.trim();
+        const expectedName = args.expected_name!.trim();
+        try {
+          const [application, deploymentEnvelope] = await Promise.all([
+            this.client.getApplication(applicationUuid),
+            this.client.listApplicationDeployments(applicationUuid),
+          ]);
+          if (!isRecord(application) || application.uuid !== applicationUuid) {
+            throw new Error('application_uuid could not be verified against Coolify');
+          }
+          if (application.name !== expectedName) {
+            throw new Error(
+              `expected_name does not exactly match the application name for ${applicationUuid}`,
+            );
+          }
+          const deployments = Array.isArray(deploymentEnvelope.deployments)
+            ? deploymentEnvelope.deployments.filter(isRecord)
+            : [];
+          const active = activeDeployments(deployments);
+          const view = safeApplicationLifecycleView(application, deployments);
+          const deletion = {
+            method: 'DELETE',
+            endpoint: `/api/v1/applications/${encodeURIComponent(applicationUuid)}`,
+            scope: 'application only; no explicit volume/configuration deletion flags',
+          };
+          if (args.execute !== true) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    {
+                      mode: 'preview',
+                      execute: false,
+                      ...view,
+                      active_deployments: active,
+                      deletion_request: deletion,
+                      deletion_started: false,
+                      message: 'Preview only: no application was deleted.',
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
+          if (active.length > 0) {
+            throw new Error(
+              `active deployment exists for application ${applicationUuid}; refusing deletion`,
+            );
+          }
+          await this.client.deleteApplication(applicationUuid);
+          const verification = await verifyApplicationDeleted(this.client, applicationUuid);
+          if (verification.ok !== true) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    {
+                      mode: 'execute',
+                      execute: true,
+                      application_uuid: applicationUuid,
+                      name: expectedName,
+                      deleted: false,
+                      operation_status: 'verification_failed',
+                      verification,
+                      message:
+                        'Deletion request completed, but exact read-back did not verify removal.',
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    mode: 'execute',
+                    execute: true,
+                    application_uuid: applicationUuid,
+                    name: expectedName,
+                    deleted: true,
+                    operation_status: 'deleted',
+                    verification,
+                    message: 'Exactly one application deletion request completed.',
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: delete_application refused or failed safely: ${this.client.sanitizeError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+
+    this.tool(
+      'provision_application_postgres',
+      'Guarded PostgreSQL provisioning and runtime-only application attachment. Dry-run is the default; apply=true is required for any mutation and never redeploys the application unless explicitly requested.',
+      {
+        application_uuid: z.string(),
+        project_uuid: z.string(),
+        environment_uuid: z.string().optional(),
+        environment_name: z.string().optional(),
+        server_uuid: z.string(),
+        destination_uuid: z.string(),
+        database_name: z.string(),
+        environment_variable_key: z.string(),
+        postgres_version: z.string().optional().default(PROVISION_POSTGRES_DEFAULT_VERSION),
+        storage_size: z.string().optional().default(PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE),
+        dry_run: z.boolean().default(true),
+        apply: z.boolean().default(false),
+        redeploy_application: z.boolean().optional().default(false),
+      },
+      async (rawArgs) => {
+        const args = rawArgs as ProvisionApplicationPostgresToolArgs;
+        const validationErrors = validateProvisionApplicationPostgresInput(args);
+        if (validationErrors.length > 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: provision_application_postgres refused: ${validationErrors.join('; ')}`,
+              },
+            ],
+          };
+        }
+
+        const applicationUuid = args.application_uuid!.trim();
+        const projectUuid = args.project_uuid!.trim();
+        const serverUuid = args.server_uuid!.trim();
+        const destinationUuid = args.destination_uuid!.trim();
+        const databaseName = args.database_name!.trim();
+        const variableKey = args.environment_variable_key!.trim();
+        const environmentUuid = args.environment_uuid?.trim();
+        const environmentName = args.environment_name?.trim();
+        const postgresVersion = args.postgres_version?.trim() || PROVISION_POSTGRES_DEFAULT_VERSION;
+        const storageSize = args.storage_size?.trim() || PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE;
+        const apply = args.apply === true;
+        const secrets: string[] = [];
+
+        try {
+          const [application, project, server, environments, resources, databaseSummaries] =
+            await Promise.all([
+              this.client.getApplication(applicationUuid),
+              this.client.getProject(projectUuid),
+              this.client.getServer(serverUuid),
+              this.client.listProjectEnvironments(projectUuid),
+              this.client.listResources({ include_full: true }),
+              this.client.listDatabases({ summary: true }),
+            ]);
+
+          if (!isRecord(application) || application.uuid !== applicationUuid) {
+            throw new Error('application_uuid could not be verified against Coolify');
+          }
+          if (!isRecord(project) || project.uuid !== projectUuid) {
+            throw new Error('project_uuid could not be verified against Coolify');
+          }
+          if (!isRecord(server) || server.uuid !== serverUuid) {
+            throw new Error('server_uuid could not be verified against Coolify');
+          }
+          if (server.is_usable === false || server.is_reachable === false) {
+            throw new Error('server_uuid identifies a server that is not usable');
+          }
+          if (!Array.isArray(environments)) {
+            throw new Error('Coolify returned a malformed environment response');
+          }
+          const environment = environments.find((item) => {
+            if (!isRecord(item)) return false;
+            return environmentUuid ? item.uuid === environmentUuid : item.name === environmentName;
+          });
+          if (!environment) {
+            throw new Error(
+              environmentUuid
+                ? 'environment_uuid was not found in the requested project'
+                : 'environment_name was not found in the requested project',
+            );
+          }
+          if (
+            typeof environment.project_uuid === 'string' &&
+            environment.project_uuid !== projectUuid
+          ) {
+            throw new Error('selected environment does not belong to project_uuid');
+          }
+          if (typeof environment.id !== 'number') {
+            throw new Error(
+              'Coolify did not return an environment id for safe application matching',
+            );
+          }
+          if (
+            typeof application.environment_id !== 'number' ||
+            application.environment_id !== environment.id
+          ) {
+            throw new Error('application_uuid does not belong to the selected project environment');
+          }
+
+          const applicationDestination = destinationUuidOf(application);
+          const applicationServer = destinationServerUuidOf(application);
+          if (applicationDestination !== destinationUuid || applicationServer !== serverUuid) {
+            throw new Error(
+              'application_uuid is not attached to the selected destination/server; refusing cross-destination database wiring',
+            );
+          }
+
+          const resourceList = Array.isArray(resources) ? resources : [];
+          const destinationVerified = resourceList.some(
+            (resource) =>
+              destinationUuidOf(resource) === destinationUuid &&
+              destinationServerUuidOf(resource) === serverUuid,
+          );
+          if (!destinationVerified) {
+            throw new Error('destination_uuid could not be verified as belonging to server_uuid');
+          }
+
+          const summaries = Array.isArray(databaseSummaries) ? databaseSummaries : [];
+          const postgresCandidates = summaries.filter((database) =>
+            databaseTypeOf(database).includes('postgres'),
+          );
+          const fullDatabases = await Promise.all(
+            postgresCandidates
+              .filter((database) => isRecord(database) && typeof database.uuid === 'string')
+              .map((database) => this.client.getDatabase(database.uuid as string)),
+          );
+          const conflictingDatabases = fullDatabases.filter((database) => {
+            if (!isRecord(database)) return false;
+            return database.name === databaseName || database.postgres_db === databaseName;
+          });
+          if (conflictingDatabases.length > 1) {
+            throw new Error(
+              'multiple PostgreSQL resources conflict with database_name; refusing to choose one',
+            );
+          }
+          const candidate = conflictingDatabases[0];
+          let existingDatabase: Database | undefined;
+          let databaseAction: 'create' | 'reuse' = 'create';
+          let existingStorage: Record<string, unknown> | undefined;
+          if (candidate) {
+            const exactName =
+              candidate.name === databaseName && candidate.postgres_db === databaseName;
+            const sameEnvironment =
+              environmentIdOf(candidate) === environment.id ||
+              candidate.environment_uuid === environment.uuid;
+            const sameDestination = destinationUuidOf(candidate) === destinationUuid;
+            const sameServer = destinationServerUuidOf(candidate) === serverUuid;
+            const sameProject =
+              typeof candidate.project_uuid !== 'string' || candidate.project_uuid === projectUuid;
+            if (!exactName || !sameEnvironment || !sameDestination || !sameServer || !sameProject) {
+              throw new Error(
+                'an existing database conflicts with the requested name or placement; refusing to overwrite it',
+              );
+            }
+            existingDatabase = candidate;
+            databaseAction = 'reuse';
+            existingStorage = (await this.client.listDatabaseStorages(
+              candidate.uuid,
+            )) as unknown as Record<string, unknown>;
+          }
+
+          const applicationEnvVars = await this.client.listApplicationEnvVars(applicationUuid, {
+            summary: true,
+          });
+          const existingVariable = Array.isArray(applicationEnvVars)
+            ? applicationEnvVars.find(
+                (variable) => isRecord(variable) && variable.key === variableKey,
+              )
+            : undefined;
+          const variableAction = existingVariable ? 'update' : 'create';
+          const persistentStorageExists =
+            isRecord(existingStorage) &&
+            Array.isArray(existingStorage.persistent_storages) &&
+            existingStorage.persistent_storages.some(
+              (storage) =>
+                isRecord(storage) && storage.mount_path === PROVISION_POSTGRES_DATA_MOUNT,
+            );
+
+          if (!apply) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    {
+                      operation_status: 'validated',
+                      dry_run: true,
+                      apply: false,
+                      database_uuid: existingDatabase?.uuid ?? null,
+                      database_name: databaseName,
+                      database_status: existingDatabase
+                        ? safeProvisionDatabaseStatus(existingDatabase)
+                        : 'not_created',
+                      database_action: databaseAction,
+                      postgres_version: postgresVersion,
+                      persistent_storage: {
+                        action: persistentStorageExists ? 'reuse' : 'create',
+                        type: 'persistent',
+                        mount_path: PROVISION_POSTGRES_DATA_MOUNT,
+                        requested_size: storageSize,
+                        coolify_managed: true,
+                      },
+                      application_uuid: applicationUuid,
+                      application_name: application.name,
+                      environment_variable_key: variableKey,
+                      variable_action: variableAction,
+                      variable_attached: false,
+                      created_or_reused: existingDatabase ? 'reused' : 'would_create',
+                      redeploy_required: args.redeploy_application !== true,
+                      message:
+                        'Dry-run only: no database, storage, variable, or redeployment was performed.',
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
+
+          let database = existingDatabase;
+          let createdDatabase = false;
+          if (!database) {
+            const created = await this.client.createPostgresql({
+              server_uuid: serverUuid,
+              project_uuid: projectUuid,
+              environment_uuid: environment.uuid,
+              destination_uuid: destinationUuid,
+              name: databaseName,
+              postgres_db: databaseName,
+              image: `postgres:${postgresVersion}`,
+              instant_deploy: true,
+            });
+            if (
+              !isRecord(created) ||
+              typeof created.uuid !== 'string' ||
+              !isSafeCoolifyResourceId(created.uuid)
+            ) {
+              throw new Error(
+                'Coolify returned malformed PostgreSQL creation metadata; retry using the existing resource if creation completed',
+              );
+            }
+            database = await this.client.getDatabase(created.uuid);
+            createdDatabase = true;
+          }
+
+          if (!databaseIsReady(database)) {
+            if (!createdDatabase) await this.client.startDatabase(database.uuid);
+            database = await waitForPostgresReady(this.client, database.uuid);
+          }
+
+          const storageState = (await this.client.listDatabaseStorages(
+            database.uuid,
+          )) as unknown as Record<string, unknown>;
+          const hasPersistentStorage =
+            Array.isArray(storageState.persistent_storages) &&
+            storageState.persistent_storages.some(
+              (storage) =>
+                isRecord(storage) && storage.mount_path === PROVISION_POSTGRES_DATA_MOUNT,
+            );
+          if (!hasPersistentStorage) {
+            await this.client.createDatabaseStorage(database.uuid, {
+              type: 'persistent',
+              name: `${databaseName}-data`,
+              mount_path: PROVISION_POSTGRES_DATA_MOUNT,
+            });
+          }
+
+          const connectionUrl = internalPostgresUrl(database);
+          secrets.push(
+            connectionUrl,
+            database.postgres_password ?? '',
+            database.internal_db_url ?? '',
+          );
+          const envData = {
+            key: variableKey,
+            value: connectionUrl,
+            is_buildtime: false,
+            is_runtime: true,
+          };
+          if (existingVariable) {
+            await this.client.updateApplicationEnvVar(applicationUuid, envData);
+          } else {
+            await this.client.createApplicationEnvVar(applicationUuid, envData);
+          }
+          const verifiedVariables = await this.client.listApplicationEnvVars(applicationUuid, {
+            summary: true,
+          });
+          const attached =
+            Array.isArray(verifiedVariables) &&
+            verifiedVariables.some(
+              (variable) =>
+                isRecord(variable) &&
+                variable.key === variableKey &&
+                variable.is_runtime === true &&
+                variable.is_buildtime === false,
+            );
+          if (!attached)
+            throw new Error(
+              'Coolify did not verify the runtime-only application variable attachment',
+            );
+
+          let redeployRequired = true;
+          if (args.redeploy_application === true) {
+            await this.client.restartApplication(applicationUuid);
+            redeployRequired = false;
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    database_uuid: database.uuid,
+                    database_name: databaseName,
+                    database_status: safeProvisionDatabaseStatus(database),
+                    application_uuid: applicationUuid,
+                    environment_variable_key: variableKey,
+                    variable_attached: true,
+                    created_or_reused: createdDatabase ? 'created' : 'reused',
+                    redeploy_required: redeployRequired,
+                    operation_status: 'completed',
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: provision_application_postgres failed safely: ${provisionError(this.client, error, secrets)}`,
               },
             ],
           };
@@ -1900,6 +3009,231 @@ export class CoolifyMcpServer extends McpServer {
     // =========================================================================
     // Environment Variables (1 tool - consolidated)
     // =========================================================================
+    const listEnvEntries = async (
+      resource: 'application' | 'service' | 'database',
+      uuid: string,
+    ): Promise<Record<string, unknown>[]> => {
+      const result: unknown =
+        resource === 'application'
+          ? await this.client.listApplicationEnvVars(uuid, { summary: false, reveal: true })
+          : resource === 'service'
+            ? await this.client.listServiceEnvVars(uuid, { reveal: true })
+            : await this.client.listDatabaseEnvVars(uuid);
+      return Array.isArray(result) ? result.filter(isRecord) : [];
+    };
+    const envMutation = (
+      target: Record<string, unknown>,
+      changed: boolean,
+      verified: boolean,
+      warnings: string[] = [],
+    ) => ({
+      requested_target: target,
+      applied_target: changed ? target : null,
+      changed,
+      verified,
+      warnings,
+      audit_id: crypto.randomUUID(),
+    });
+    const safeEnvEntry = (entry: Record<string, unknown>) => ({
+      entry_uuid: entry.uuid ?? null,
+      key: entry.key ?? null,
+      is_buildtime: entry.is_buildtime ?? null,
+      is_runtime: entry.is_runtime ?? null,
+      has_value: Boolean(entry.value || entry.real_value),
+      secret_redacted: true,
+    });
+    this.tool(
+      'inspect_env',
+      'Inspect only an explicit bounded key list for one exact Coolify resource UUID. Values are always redacted; duplicate and effective-entry metadata is retained.',
+      {
+        resource: z.enum(['application', 'service', 'database']),
+        uuid: z.string(),
+        keys: z.array(z.string().min(1)).min(1).max(100),
+      },
+      async ({ resource, uuid, keys }) =>
+        wrap(async () => {
+          if (!isSafeCoolifyResourceId(uuid))
+            throw new Error('TARGET_MISMATCH: uuid must be an exact Coolify resource identifier');
+          const requestedKeys = [...new Set(keys)];
+          const all = await listEnvEntries(resource, uuid);
+          const selected = all.filter((entry) => requestedKeys.includes(String(entry.key)));
+          const byKey = new Map<string, Record<string, unknown>[]>();
+          for (const entry of selected) {
+            const key = String(entry.key);
+            byKey.set(key, [...(byKey.get(key) ?? []), entry]);
+          }
+          const entries = requestedKeys.map((key) => {
+            const matches = byKey.get(key) ?? [];
+            const flagPairs = new Set(
+              matches.map((entry) => `${Boolean(entry.is_buildtime)}:${Boolean(entry.is_runtime)}`),
+            );
+            return {
+              key,
+              entries: matches.map(safeEnvEntry),
+              duplicate_count: Math.max(0, matches.length - 1),
+              conflicting_flags: flagPairs.size > 1,
+              effective_entry_uuid: matches.length
+                ? (matches[matches.length - 1].uuid ?? null)
+                : null,
+              effective_value_redacted: true,
+            };
+          });
+          return {
+            resource,
+            uuid,
+            requested_keys: requestedKeys,
+            entries,
+            unrelated_entries_returned: 0,
+            secret_redacted: true,
+          };
+        }),
+    );
+    this.tool(
+      'reconcile_env',
+      'Preview-first exact-key environment reconciliation. Only requested keys may be created, updated, or deduplicated; plaintext values are never returned.',
+      {
+        resource: z.enum(['application', 'service', 'database']),
+        uuid: z.string(),
+        keys: z.array(z.string().min(1)).min(1).max(100),
+        desired_values: z.record(z.string(), z.string()).optional(),
+        server_side_secret_refs: z.record(z.string(), z.string()).optional(),
+        apply: z.boolean().optional().default(false),
+      },
+      async ({ resource, uuid, keys, desired_values, server_side_secret_refs, apply }) =>
+        wrap(async () => {
+          if (!isSafeCoolifyResourceId(uuid))
+            throw new Error('TARGET_MISMATCH: uuid must be an exact Coolify resource identifier');
+          const requestedKeys = [...new Set(keys)];
+          const desired = { ...(desired_values ?? {}) };
+          for (const [key, reference] of Object.entries(server_side_secret_refs ?? {}))
+            desired[key] = reference;
+          for (const key of Object.keys(desired))
+            if (!requestedKeys.includes(key))
+              throw new Error(`TARGET_MISMATCH: desired value supplied for unrequested key ${key}`);
+          const all = await listEnvEntries(resource, uuid);
+          const byKey = new Map<string, Record<string, unknown>[]>();
+          for (const entry of all)
+            if (requestedKeys.includes(String(entry.key)))
+              byKey.set(String(entry.key), [...(byKey.get(String(entry.key)) ?? []), entry]);
+          const retained: Record<string, unknown>[] = [],
+            created: string[] = [],
+            updated: string[] = [],
+            deleted: string[] = [],
+            warnings: string[] = [];
+          for (const key of requestedKeys) {
+            const matches = byKey.get(key) ?? [];
+            const canonical = matches[matches.length - 1];
+            if (!canonical) {
+              if (desired[key] === undefined)
+                warnings.push(`no value supplied for missing key ${key}`);
+              else created.push(key);
+            } else {
+              retained.push(safeEnvEntry(canonical));
+              if (
+                desired[key] !== undefined &&
+                desired[key] !== canonical.value &&
+                desired[key] !== canonical.real_value
+              )
+                updated.push(key);
+              for (const duplicate of matches.slice(0, -1))
+                if (duplicate.uuid) deleted.push(String(duplicate.uuid));
+            }
+          }
+          const target = { resource, uuid, keys: requestedKeys };
+          if (!apply)
+            return {
+              ok: true,
+              ...envMutation(target, false, true, warnings),
+              preview_only: true,
+              retained,
+              created,
+              updated,
+              deleted,
+              note: 'No changes were made. Re-run with apply=true.',
+            };
+          const methods = {
+            application: {
+              create: (key: string, value: string, entry?: Record<string, unknown>) =>
+                entry
+                  ? this.client.updateApplicationEnvVar(uuid, {
+                      key,
+                      value,
+                      is_buildtime: Boolean(entry.is_buildtime),
+                      is_runtime: Boolean(entry.is_runtime),
+                    })
+                  : this.client.createApplicationEnvVar(uuid, { key, value }),
+              delete: (entryUuid: string) => this.client.deleteApplicationEnvVar(uuid, entryUuid),
+            },
+            service: {
+              create: (key: string, value: string, entry?: Record<string, unknown>) =>
+                entry
+                  ? this.client.updateServiceEnvVar(uuid, {
+                      key,
+                      value,
+                      is_buildtime: Boolean(entry.is_buildtime),
+                      is_runtime: Boolean(entry.is_runtime),
+                    })
+                  : this.client.createServiceEnvVar(uuid, { key, value }),
+              delete: (entryUuid: string) => this.client.deleteServiceEnvVar(uuid, entryUuid),
+            },
+            database: {
+              create: (key: string, value: string, entry?: Record<string, unknown>) =>
+                entry
+                  ? this.client.updateDatabaseEnvVar(uuid, {
+                      key,
+                      value,
+                      is_buildtime: Boolean(entry.is_buildtime),
+                      is_runtime: Boolean(entry.is_runtime),
+                    })
+                  : this.client.createDatabaseEnvVar(uuid, { key, value }),
+              delete: (entryUuid: string) => this.client.deleteDatabaseEnvVar(uuid, entryUuid),
+            },
+          }[resource];
+          for (const key of requestedKeys) {
+            const matches = byKey.get(key) ?? [];
+            const canonical = matches[matches.length - 1];
+            if (desired[key] !== undefined) await methods.create(key, desired[key], canonical);
+            for (const duplicate of matches.slice(0, -1))
+              if (duplicate.uuid) await methods.delete(String(duplicate.uuid));
+          }
+          const finalEntries = await listEnvEntries(resource, uuid);
+          const remaining = finalEntries.filter((entry) =>
+            requestedKeys.includes(String(entry.key)),
+          );
+          const verificationMismatches: Array<Record<string, unknown>> = [];
+          for (const key of requestedKeys) {
+            const matches = remaining.filter((entry) => String(entry.key) === key);
+            if (matches.length !== 1) {
+              verificationMismatches.push({
+                key,
+                reason: 'canonical_entry_count',
+                actual: matches.length,
+              });
+              continue;
+            }
+            if (
+              desired[key] !== undefined &&
+              desired[key] !== matches[0].value &&
+              desired[key] !== matches[0].real_value
+            ) {
+              verificationMismatches.push({ key, reason: 'desired_value', actual: '[REDACTED]' });
+            }
+          }
+          if (verificationMismatches.length > 0)
+            throw new Error(
+              `POST_WRITE_VERIFICATION_FAILED: ${JSON.stringify(verificationMismatches)}`,
+            );
+          return {
+            ok: true,
+            ...envMutation(target, true, true, warnings),
+            preview_only: false,
+            retained: remaining.map(safeEnvEntry),
+            created,
+            updated,
+            deleted,
+          };
+        }),
+    );
     this.tool(
       'env_vars',
       "Manage env vars for app, service, or database. Values are masked by default (returned as '***') to avoid leaking secrets to MCP clients; pass reveal=true on the list action when the caller explicitly needs the plaintext (e.g. 'what is FOO set to?'). Set is_buildtime=false (and/or is_runtime=true) for runtime-only vars to avoid Dockerfile ARG issues with multiline values like PEM keys.",
@@ -2281,26 +3615,52 @@ export class CoolifyMcpServer extends McpServer {
       async ({ action, uuid, name, description, private_key }) => {
         switch (action) {
           case 'list':
-            return wrap(() => this.client.listPrivateKeys());
+            return wrap(async () => {
+              const [keys, applications] = await Promise.all([
+                this.client.listPrivateKeys(),
+                this.client.listApplications(),
+              ]);
+              return {
+                keys: keys.filter(isRecord).map((key) =>
+                  safePrivateKeyMetadata(
+                    key,
+                    applications.map(
+                      (application) => application as unknown as Record<string, unknown>,
+                    ),
+                  ),
+                ),
+                secrets_redacted: true,
+              };
+            });
           case 'get':
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() => this.client.getPrivateKey(uuid));
+            return wrap(async () =>
+              safePrivateKeyMetadata((await this.client.getPrivateKey(uuid)) as any),
+            );
           case 'create':
             if (!private_key)
               return { content: [{ type: 'text' as const, text: 'Error: private_key required' }] };
-            return wrap(() =>
-              this.client.createPrivateKey({
-                private_key,
-                name: name || 'unnamed-key',
-                description,
-              }),
+            return wrap(async () =>
+              safePrivateKeyMetadata(
+                (await this.client.createPrivateKey({
+                  private_key,
+                  name: name || 'unnamed-key',
+                  description,
+                })) as any,
+              ),
             );
           case 'update':
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() =>
-              this.client.updatePrivateKey(uuid, { name, description, private_key }),
+            return wrap(async () =>
+              safePrivateKeyMetadata(
+                (await this.client.updatePrivateKey(uuid, {
+                  name,
+                  description,
+                  private_key,
+                })) as any,
+              ),
             );
           case 'delete':
             if (!uuid)

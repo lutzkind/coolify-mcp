@@ -373,6 +373,75 @@ describe('CoolifyMcpServer v2', () => {
     });
   });
 
+  describe('guarded environment tools', () => {
+    const call = async (
+      name: string,
+      args: Record<string, unknown>,
+    ): Promise<{ content: Array<{ text: string }> }> => {
+      const tool = (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools[name];
+      return (await tool.handler(args, {})) as { content: Array<{ text: string }> };
+    };
+
+    it('inspect_env returns only requested keys and redacts values', async () => {
+      jest.spyOn(server['client'], 'listApplicationEnvVars').mockResolvedValue([
+        {
+          uuid: 'env-1',
+          key: 'REQUESTED',
+          value: 'secret-value',
+          is_buildtime: false,
+          is_runtime: true,
+        },
+        {
+          uuid: 'env-2',
+          key: 'UNREQUESTED',
+          value: 'unrelated',
+          is_buildtime: false,
+          is_runtime: true,
+        },
+      ] as never);
+      const result = await call('inspect_env', {
+        resource: 'application',
+        uuid: 'abcdefghijklmnopqrstuvwx',
+        keys: ['REQUESTED'],
+      });
+      const body = JSON.parse(result.content[0].text);
+      expect(body.entries).toHaveLength(1);
+      expect(body.entries[0].entries[0].key).toBe('REQUESTED');
+      expect(JSON.stringify(body)).not.toContain('secret-value');
+      expect(JSON.stringify(body)).not.toContain('UNREQUESTED');
+    });
+
+    it('reconcile_env previews without invoking a mutation', async () => {
+      const list = jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValue([
+          { uuid: 'env-1', key: 'REQUESTED', value: 'old', is_buildtime: false, is_runtime: true },
+        ] as never);
+      const update = jest.spyOn(server['client'], 'updateApplicationEnvVar');
+      const result = await call('reconcile_env', {
+        resource: 'application',
+        uuid: 'abcdefghijklmnopqrstuvwx',
+        keys: ['REQUESTED'],
+        desired_values: { REQUESTED: 'new' },
+      });
+      const body = JSON.parse(result.content[0].text);
+      expect(body.preview_only).toBe(true);
+      expect(body.updated).toEqual(['REQUESTED']);
+      expect(update).not.toHaveBeenCalled();
+      expect(list).toHaveBeenCalledWith('abcdefghijklmnopqrstuvwx', {
+        summary: false,
+        reveal: true,
+      });
+    });
+  });
+
   describe('system tool handler', () => {
     const callSystem = async (
       srv: CoolifyMcpServer,
@@ -778,6 +847,28 @@ describe('CoolifyMcpServer v2', () => {
       expect(body.payload).not.toHaveProperty('environment_uuid');
     });
 
+    it('previews a trimmed destination UUID without making a POST', async () => {
+      const createSpy = jest.spyOn(server['client'], 'createApplicationPublic');
+
+      const result = await callCreateApplication({
+        ...baseArgs,
+        destination_uuid: ' gkw804owwskcksw0s8oww4sg ',
+      });
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(body.payload.destination_uuid).toBe('gkw804owwskcksw0s8oww4sg');
+      expect(body.created).toBe(false);
+      expect(body.deployed).toBe(false);
+    });
+
+    it('supports omitting destination_uuid without inferring one', async () => {
+      const result = await callCreateApplication(baseArgs);
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(body.payload).not.toHaveProperty('destination_uuid');
+    });
+
     it('rejects requests with neither environment selector', async () => {
       const result = await callCreateApplication({
         ...baseArgs,
@@ -808,6 +899,23 @@ describe('CoolifyMcpServer v2', () => {
       expect(result.content[0]!.text).toContain('environment_name must not be blank');
     });
 
+    it('rejects a blank destination UUID', async () => {
+      const result = await callCreateApplication({ ...baseArgs, destination_uuid: '   ' });
+
+      expect(result.content[0]!.text).toContain('destination_uuid must not be blank');
+    });
+
+    it('rejects a malformed destination UUID', async () => {
+      const result = await callCreateApplication({
+        ...baseArgs,
+        destination_uuid: 'not-a-coolify-id',
+      });
+
+      expect(result.content[0]!.text).toContain(
+        'destination_uuid is not a valid Coolify resource identifier',
+      );
+    });
+
     it('validates infrastructure, then sends the expected payload in execution mode', async () => {
       jest.spyOn(server['client'], 'getServer').mockResolvedValue({
         uuid: ids.server_uuid,
@@ -833,13 +941,18 @@ describe('CoolifyMcpServer v2', () => {
         build_pack: baseArgs.build_pack,
       } as never);
 
-      const result = await callCreateApplication({ ...baseArgs, execute: true });
+      const result = await callCreateApplication({
+        ...baseArgs,
+        destination_uuid: ' gkw804owwskcksw0s8oww4sg ',
+        execute: true,
+      });
       const body = JSON.parse(result.content[0]!.text);
 
       expect(createSpy).toHaveBeenCalledWith({
         project_uuid: ids.project_uuid,
         server_uuid: ids.server_uuid,
         environment_uuid: ids.environment_uuid,
+        destination_uuid: 'gkw804owwskcksw0s8oww4sg',
         name: 'new-safe-app',
         git_repository: 'https://github.com/example/repo.git',
         git_branch: 'main',
@@ -996,6 +1109,496 @@ describe('CoolifyMcpServer v2', () => {
     });
   });
 
+  describe('private key and application lifecycle tools', () => {
+    const ids = {
+      application_uuid: 'abcdefghijklmnopqrstuvwx',
+      project_uuid: 'bcdefghijklmnopqrstuvwxy',
+      environment_uuid: 'cdefghijklmnopqrstuvwxyz',
+      server_uuid: 'defghijklmnopqrstuvwxyza',
+      private_key_uuid: 'efghijklmnopqrstuvwxyzaa',
+    };
+
+    const toolHandler = (name: string) =>
+      (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools[name]!.handler;
+
+    const createArgs = {
+      name: 'private-repo-app',
+      git_repository: 'git@github.com:example/private.git',
+      git_branch: 'main',
+      server_uuid: ids.server_uuid,
+      project_uuid: ids.project_uuid,
+      environment_uuid: ids.environment_uuid,
+      destination_uuid: 'fghijklmnopqrstuvwxyzaab',
+      private_key_uuid: ` ${ids.private_key_uuid} `,
+      build_pack: 'dockerfile',
+      ports_exposes: '8080',
+      execute: false,
+    };
+
+    const mockCreatePreflight = (): void => {
+      jest.spyOn(server['client'], 'getServer').mockResolvedValue({
+        uuid: ids.server_uuid,
+        is_usable: true,
+      } as never);
+      jest
+        .spyOn(server['client'], 'getProject')
+        .mockResolvedValue({ uuid: ids.project_uuid } as never);
+      jest
+        .spyOn(server['client'], 'listProjectEnvironments')
+        .mockResolvedValue([{ uuid: ids.environment_uuid }] as never);
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([]);
+      jest
+        .spyOn(server['client'], 'getPrivateKey')
+        .mockResolvedValue({ uuid: ids.private_key_uuid } as never);
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: createArgs.name,
+      } as never);
+    };
+
+    it('lists private keys as metadata and omits all key material', async () => {
+      jest.spyOn(server['client'], 'listPrivateKeys').mockResolvedValue([
+        {
+          id: 7,
+          uuid: ids.private_key_uuid,
+          name: 'repo key',
+          description: 'safe description',
+          private_key: '-----BEGIN PRIVATE KEY-----SECRET',
+          public_key: 'ssh-ed25519 PUBLIC',
+          fingerprint: 'SHA256:sensitive',
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-02T00:00:00Z',
+        },
+      ] as never);
+      jest
+        .spyOn(server['client'], 'listApplications')
+        .mockResolvedValue([{ uuid: ids.application_uuid, private_key_id: 7 }] as never);
+
+      const result = (await toolHandler('list_private_keys')({}, {})) as {
+        content: Array<{ text: string }>;
+      };
+      const text = result.content[0]!.text;
+      const body = JSON.parse(text);
+
+      expect(body.keys).toEqual([
+        expect.objectContaining({
+          uuid: ids.private_key_uuid,
+          name: 'repo key',
+          used_by_applications: true,
+          used_by_application_count: 1,
+          secrets_redacted: true,
+        }),
+      ]);
+      expect(text).not.toContain('BEGIN PRIVATE KEY');
+      expect(text).not.toContain('ssh-ed25519 PUBLIC');
+      expect(text).not.toContain('SHA256:sensitive');
+    });
+
+    it('fails safely when private-key listing fails', async () => {
+      jest
+        .spyOn(server['client'], 'listPrivateKeys')
+        .mockRejectedValue(new Error('upstream private_key=super-secret'));
+
+      const result = (await toolHandler('list_private_keys')({}, {})) as {
+        content: Array<{ text: string }>;
+      };
+
+      expect(result.content[0]!.text).toContain('failed safely');
+      expect(result.content[0]!.text).not.toContain('super-secret');
+    });
+
+    it('returns an empty safe list when Coolify has no private keys', async () => {
+      jest.spyOn(server['client'], 'listPrivateKeys').mockResolvedValue([]);
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([]);
+
+      const result = (await toolHandler('list_private_keys')({}, {})) as {
+        content: Array<{ text: string }>;
+      };
+
+      expect(JSON.parse(result.content[0]!.text)).toMatchObject({
+        keys: [],
+        secrets_redacted: true,
+      });
+    });
+
+    it('previews private-key application creation with the exact supplied key and no POST', async () => {
+      const createPublic = jest.spyOn(server['client'], 'createApplicationPublic');
+      const createPrivate = jest.spyOn(server['client'], 'createApplicationPrivateKey');
+
+      const result = (await toolHandler('create_application')(createArgs, {})) as {
+        content: Array<{ text: string }>;
+      };
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(body.endpoint).toBe('/api/v1/applications/private-deploy-key');
+      expect(body.payload.private_key_uuid).toBe(ids.private_key_uuid);
+      expect(createPublic).not.toHaveBeenCalled();
+      expect(createPrivate).not.toHaveBeenCalled();
+    });
+
+    it('executes private-key creation with the exact key and never deploys', async () => {
+      mockCreatePreflight();
+      const createPrivate = jest
+        .spyOn(server['client'], 'createApplicationPrivateKey')
+        .mockResolvedValue({ uuid: ids.application_uuid });
+      const deploy = jest.spyOn(server['client'], 'deployByTagOrUuid');
+
+      const result = (await toolHandler('create_application')(
+        { ...createArgs, execute: true },
+        {},
+      )) as {
+        content: Array<{ text: string }>;
+      };
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createPrivate).toHaveBeenCalledWith(
+        expect.objectContaining({ private_key_uuid: ids.private_key_uuid }),
+      );
+      expect(deploy).not.toHaveBeenCalled();
+      expect(body.deployed).toBe(false);
+    });
+
+    it('rejects blank and malformed private-key UUIDs', async () => {
+      const blank = (await toolHandler('create_application')(
+        { ...createArgs, private_key_uuid: '  ' },
+        {},
+      )) as {
+        content: Array<{ text: string }>;
+      };
+      const malformed = (await toolHandler('create_application')(
+        { ...createArgs, private_key_uuid: 'bad' },
+        {},
+      )) as {
+        content: Array<{ text: string }>;
+      };
+
+      expect(blank.content[0]!.text).toContain('private_key_uuid must not be blank');
+      expect(malformed.content[0]!.text).toContain(
+        'private_key_uuid is not a valid Coolify resource identifier',
+      );
+    });
+
+    it('previews deployment without mutation and defaults execute to false', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+        git_repository: createArgs.git_repository,
+        git_branch: 'main',
+        status: 'exited:unhealthy',
+        fqdn: 'https://private.example.com',
+      } as never);
+      jest.spyOn(server['client'], 'listApplicationDeployments').mockResolvedValue({
+        count: 0,
+        deployments: [],
+      });
+      const trigger = jest.spyOn(server['client'], 'deployByTagOrUuid');
+
+      const result = (await toolHandler('deploy_application')(
+        {
+          application_uuid: ` ${ids.application_uuid} `,
+          force_rebuild: false,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(body.execute).toBe(false);
+      expect(body.deployment_request.endpoint).toBe(
+        `/api/v1/deploy?uuid=${ids.application_uuid}&force=false`,
+      );
+      expect(body.deployment_started).toBe(false);
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it('rejects active deployment and sends exactly one deployment request otherwise', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+      } as never);
+      const deployments = jest
+        .spyOn(server['client'], 'listApplicationDeployments')
+        .mockResolvedValue({
+          count: 1,
+          deployments: [{ deployment_uuid: 'active-deployment', status: 'queued' }],
+        } as never);
+      const trigger = jest
+        .spyOn(server['client'], 'deployByTagOrUuid')
+        .mockResolvedValue({ deployments: [{ deployment_uuid: 'new-deployment' }] });
+
+      const blocked = (await toolHandler('deploy_application')(
+        {
+          application_uuid: ids.application_uuid,
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      expect(blocked.content[0]!.text).toContain('active deployment exists');
+      expect(trigger).not.toHaveBeenCalled();
+
+      deployments.mockResolvedValueOnce({ count: 0, deployments: [] });
+      deployments.mockResolvedValueOnce({
+        count: 1,
+        deployments: [{ deployment_uuid: 'new-deployment', status: 'queued' }],
+      } as never);
+      const executed = (await toolHandler('deploy_application')(
+        {
+          application_uuid: ids.application_uuid,
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(executed.content[0]!.text);
+      expect(trigger).toHaveBeenCalledTimes(1);
+      expect(body.deployment_uuid).toBe('new-deployment');
+    });
+
+    it('surfaces a deployment failure without retrying', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+      } as never);
+      jest.spyOn(server['client'], 'listApplicationDeployments').mockResolvedValue({
+        count: 0,
+        deployments: [],
+      });
+      const trigger = jest
+        .spyOn(server['client'], 'deployByTagOrUuid')
+        .mockRejectedValue(new Error('upstream deployment failed'));
+
+      const result = (await toolHandler('deploy_application')(
+        { application_uuid: ids.application_uuid, execute: true },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      expect(result.content[0]!.text).toContain('upstream deployment failed');
+      expect(trigger).toHaveBeenCalledTimes(1);
+    });
+
+    it('previews deletion, enforces exact name, and blocks active deployments', async () => {
+      let applicationExists = true;
+      jest.spyOn(server['client'], 'getApplication').mockImplementation(async () => {
+        if (!applicationExists) throw new Error('HTTP 404: not found');
+        return {
+          uuid: ids.application_uuid,
+          name: 'private-repo-app',
+          git_repository: createArgs.git_repository,
+          git_branch: 'main',
+          status: 'exited:unhealthy',
+          fqdn: 'https://private.example.com',
+        } as never;
+      });
+      const deployments = jest
+        .spyOn(server['client'], 'listApplicationDeployments')
+        .mockResolvedValue({ count: 0, deployments: [] });
+      const deleteSpy = jest
+        .spyOn(server['client'], 'deleteApplication')
+        .mockImplementation(async () => {
+          applicationExists = false;
+          return { message: 'deleted' };
+        });
+
+      const preview = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(preview.content[0]!.text);
+      expect(body.execute).toBe(false);
+      expect(body.deletion_started).toBe(false);
+      expect(deleteSpy).not.toHaveBeenCalled();
+
+      const deleted = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const deletedBody = JSON.parse(deleted.content[0]!.text);
+      expect(deletedBody.deleted).toBe(true);
+      expect(deletedBody.verification).toMatchObject({
+        ok: true,
+        status: 'not_found',
+        exists: false,
+      });
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(deleteSpy).toHaveBeenCalledWith(ids.application_uuid);
+
+      applicationExists = true;
+      const mismatch = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'wrong-name',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      expect(mismatch.content[0]!.text).toContain('does not exactly match');
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+
+      deployments.mockResolvedValue({
+        count: 1,
+        deployments: [{ deployment_uuid: 'active-deployment', status: 'in_progress' } as never],
+      } as never);
+      const blocked = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      expect(blocked.content[0]!.text).toContain('active deployment exists');
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not claim deletion when the exact application still exists', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+      } as never);
+      jest
+        .spyOn(server['client'], 'listApplicationDeployments')
+        .mockResolvedValue({ count: 0, deployments: [] });
+      const deleteSpy = jest
+        .spyOn(server['client'], 'deleteApplication')
+        .mockResolvedValue({ message: 'deleted' });
+
+      const result = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(result.content[0]!.text);
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(body.deleted).toBe(false);
+      expect(body.operation_status).toBe('verification_failed');
+      expect(body.verification).toMatchObject({ ok: false, status: 'still_exists', exists: true });
+    });
+
+    it('does not claim deletion when the read-back fails unexpectedly', async () => {
+      jest
+        .spyOn(server['client'], 'getApplication')
+        .mockResolvedValueOnce({ uuid: ids.application_uuid, name: 'private-repo-app' } as never)
+        .mockRejectedValueOnce(new Error('HTTP 500: Coolify read-back unavailable'));
+      jest
+        .spyOn(server['client'], 'listApplicationDeployments')
+        .mockResolvedValue({ count: 0, deployments: [] });
+      const deleteSpy = jest
+        .spyOn(server['client'], 'deleteApplication')
+        .mockResolvedValue({ message: 'deleted' });
+
+      const result = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(result.content[0]!.text);
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(body.deleted).toBe(false);
+      expect(body.verification).toMatchObject({
+        ok: false,
+        status: 'readback_error',
+        exists: null,
+      });
+    });
+
+    it('rejects malformed lifecycle UUIDs before lookup', async () => {
+      const getApplication = jest.spyOn(server['client'], 'getApplication');
+      const deployResult = (await toolHandler('deploy_application')(
+        {
+          application_uuid: 'bad',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const deleteResult = (await toolHandler('delete_application')(
+        {
+          application_uuid: 'bad',
+          expected_name: 'anything',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      expect(deployResult.content[0]!.text).toContain('not a valid Coolify resource identifier');
+      expect(deleteResult.content[0]!.text).toContain('not a valid Coolify resource identifier');
+      expect(getApplication).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('list_applications pagination', () => {
+    const toolHandler = () =>
+      (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools.list_applications!.handler;
+
+    const callList = async (args: Record<string, unknown>) => {
+      const result = (await toolHandler()(args, {})) as { content: Array<{ text: string }> };
+      return JSON.parse(result.content[0]!.text) as {
+        data: Array<{ uuid: string }>;
+        pagination: { page: number; per_page: number; total: number; has_next: boolean };
+        _pagination?: { next?: unknown; prev?: unknown };
+      };
+    };
+
+    it('returns first, second, and last pages with accurate next metadata', async () => {
+      jest
+        .spyOn(server['client'], 'listApplications')
+        .mockResolvedValue(['a', 'b', 'c'].map((uuid) => ({ uuid, name: uuid })) as never);
+      const first = await callList({ page: 1, per_page: 1 });
+      const second = await callList({ page: 2, per_page: 1 });
+      const last = await callList({ page: 3, per_page: 1 });
+      expect(first.data).toHaveLength(1);
+      expect(first.data[0]!.uuid).toBe('a');
+      expect(first.pagination.has_next).toBe(true);
+      expect(first._pagination?.next).toBeDefined();
+      expect(second.data[0]!.uuid).toBe('b');
+      expect(second._pagination?.prev).toBeDefined();
+      expect(second._pagination?.next).toBeDefined();
+      expect(last.data[0]!.uuid).toBe('c');
+      expect(last.pagination.has_next).toBe(false);
+      expect(last._pagination?.next).toBeUndefined();
+    });
+
+    it('bounds excessive page sizes and returns an empty page without a next link', async () => {
+      jest
+        .spyOn(server['client'], 'listApplications')
+        .mockResolvedValue([{ uuid: 'a', name: 'a' }] as never);
+      const bounded = await callList({ page: 1, per_page: 100000 });
+      expect(bounded.pagination.per_page).toBe(100);
+      expect(bounded.data).toHaveLength(1);
+      const empty = await callList({ page: 1, per_page: 1 });
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([] as never);
+      const noResults = await callList({ page: 1, per_page: 1 });
+      expect(empty.pagination.has_next).toBe(false);
+      expect(noResults.data).toEqual([]);
+      expect(noResults.pagination).toMatchObject({ total: 0, has_next: false });
+      expect(noResults._pagination).toBeUndefined();
+    });
+  });
+
   describe('database tool handler', () => {
     // Regression for #217 — the database tool's create action didn't expose
     // destination_uuid, so Coolify rejected creates on servers with more than
@@ -1051,6 +1654,383 @@ describe('CoolifyMcpServer v2', () => {
 
       const forwarded = spy.mock.calls[0]?.[0] as unknown as Record<string, unknown>;
       expect(forwarded.destination_uuid).toBeUndefined();
+    });
+  });
+
+  describe('provision_application_postgres tool handler', () => {
+    const ids = {
+      application_uuid: 'abcdefghijklmnopqrstuvwx',
+      project_uuid: 'bcdefghijklmnopqrstuvwxy',
+      environment_uuid: 'cdefghijklmnopqrstuvwxyz',
+      server_uuid: 'defghijklmnopqrstuvwxyza',
+      destination_uuid: 'efghijklmnopqrstuvwxyzaa',
+      database_uuid: 'fghijklmnopqrstuvwxyzaab',
+    };
+    const baseArgs = {
+      application_uuid: ids.application_uuid,
+      project_uuid: ids.project_uuid,
+      environment_name: ' production ',
+      server_uuid: ids.server_uuid,
+      destination_uuid: ` ${ids.destination_uuid} `,
+      database_name: 'managed_data',
+      environment_variable_key: 'MANAGED_DATABASE_URL',
+      postgres_version: '16',
+      storage_size: '10Gi',
+      dry_run: true,
+      apply: false,
+    };
+
+    const callProvision = async (
+      srv: CoolifyMcpServer,
+      args: Record<string, unknown>,
+    ): Promise<{ content: Array<{ text: string }> }> => {
+      const tool = (
+        srv as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools['provision_application_postgres'];
+      return (await tool.handler(args, {})) as { content: Array<{ text: string }> };
+    };
+
+    const mockPreflight = (srv: CoolifyMcpServer, databases: unknown[] = []): void => {
+      jest.spyOn(srv['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'generic-app',
+        environment_id: 1,
+        destination: {
+          uuid: ids.destination_uuid,
+          server: { uuid: ids.server_uuid },
+        },
+      } as never);
+      jest
+        .spyOn(srv['client'], 'getProject')
+        .mockResolvedValue({ uuid: ids.project_uuid } as never);
+      jest.spyOn(srv['client'], 'getServer').mockResolvedValue({
+        uuid: ids.server_uuid,
+        is_usable: true,
+        is_reachable: true,
+      } as never);
+      jest.spyOn(srv['client'], 'listProjectEnvironments').mockResolvedValue([
+        {
+          id: 1,
+          uuid: ids.environment_uuid,
+          name: 'production',
+          project_uuid: ids.project_uuid,
+        },
+      ] as never);
+      jest.spyOn(srv['client'], 'listResources').mockResolvedValue([
+        {
+          uuid: 'resource-uuid',
+          name: 'generic-app',
+          type: 'application',
+          destination: { uuid: ids.destination_uuid, server: { uuid: ids.server_uuid } },
+        },
+      ] as never);
+      jest.spyOn(srv['client'], 'listDatabases').mockResolvedValue(databases as never);
+      jest.spyOn(srv['client'], 'listApplicationEnvVars').mockResolvedValue([] as never);
+    };
+
+    const readyDatabase = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      uuid: ids.database_uuid,
+      name: 'managed_data',
+      postgres_db: 'managed_data',
+      database_type: 'standalone-postgresql',
+      status: 'running:healthy',
+      environment_id: 1,
+      destination: { uuid: ids.destination_uuid, server: { uuid: ids.server_uuid } },
+      internal_db_url: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+      postgres_password: 'super-secret',
+      ...overrides,
+    });
+
+    it('performs a generic dry-run without POSTs or secret output', async () => {
+      mockPreflight(server);
+      const createDatabase = jest.spyOn(server['client'], 'createPostgresql');
+      const createStorage = jest.spyOn(server['client'], 'createDatabaseStorage');
+      const createVariable = jest.spyOn(server['client'], 'createApplicationEnvVar');
+
+      const result = await callProvision(server, baseArgs);
+      const text = result.content[0]!.text;
+      const body = JSON.parse(text);
+
+      expect(body).toMatchObject({
+        operation_status: 'validated',
+        dry_run: true,
+        apply: false,
+        database_name: 'managed_data',
+        database_action: 'create',
+        application_uuid: ids.application_uuid,
+        environment_variable_key: 'MANAGED_DATABASE_URL',
+        variable_action: 'create',
+        variable_attached: false,
+      });
+      expect(body.persistent_storage).toMatchObject({
+        type: 'persistent',
+        mount_path: '/var/lib/postgresql/data',
+        requested_size: '10Gi',
+        coolify_managed: true,
+      });
+      expect(createDatabase).not.toHaveBeenCalled();
+      expect(createStorage).not.toHaveBeenCalled();
+      expect(createVariable).not.toHaveBeenCalled();
+      expect(text).not.toContain('super-secret');
+      expect(
+        (server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools[
+          'provision_application_postgres'
+        ],
+      ).toBeDefined();
+    });
+
+    it('validates malformed identifiers before any lookup', async () => {
+      const getApplication = jest.spyOn(server['client'], 'getApplication');
+      const result = await callProvision(server, {
+        ...baseArgs,
+        application_uuid: 'bad',
+        project_uuid: 'bad',
+        environment_uuid: 'bad',
+        environment_name: undefined,
+        server_uuid: 'bad',
+        destination_uuid: 'bad',
+      });
+
+      expect(result.content[0]!.text).toContain(
+        'application_uuid is not a valid Coolify resource identifier',
+      );
+      expect(result.content[0]!.text).toContain(
+        'environment_uuid is not a valid Coolify resource identifier',
+      );
+      expect(getApplication).not.toHaveBeenCalled();
+    });
+
+    it('rejects a destination/server mismatch before mutation', async () => {
+      mockPreflight(server);
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        environment_id: 1,
+        destination: { uuid: ids.destination_uuid, server: { uuid: 'different-server-uuid' } },
+      } as never);
+      const createDatabase = jest.spyOn(server['client'], 'createPostgresql');
+
+      const result = await callProvision(server, baseArgs);
+
+      expect(result.content[0]!.text).toContain('not attached to the selected destination/server');
+      expect(createDatabase).not.toHaveBeenCalled();
+    });
+
+    it('creates PostgreSQL with the selected context, persistent storage, and runtime-only variable', async () => {
+      mockPreflight(server);
+      const createDatabase = jest
+        .spyOn(server['client'], 'createPostgresql')
+        .mockResolvedValue({ uuid: ids.database_uuid });
+      jest.spyOn(server['client'], 'getDatabase').mockResolvedValue(readyDatabase() as never);
+      const listStorage = jest
+        .spyOn(server['client'], 'listDatabaseStorages')
+        .mockResolvedValue({ persistent_storages: [], file_storages: [] });
+      const createStorage = jest
+        .spyOn(server['client'], 'createDatabaseStorage')
+        .mockResolvedValue({ message: 'created' });
+      const createVariable = jest
+        .spyOn(server['client'], 'createApplicationEnvVar')
+        .mockResolvedValue({ uuid: 'env-uuid' });
+      jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValueOnce([] as never)
+        .mockResolvedValueOnce([
+          { key: 'MANAGED_DATABASE_URL', is_runtime: true, is_buildtime: false },
+        ] as never);
+
+      const result = await callProvision(server, {
+        ...baseArgs,
+        environment_name: undefined,
+        environment_uuid: ids.environment_uuid,
+        dry_run: false,
+        apply: true,
+      });
+      const text = result.content[0]!.text;
+      const body = JSON.parse(text);
+
+      expect(createDatabase).toHaveBeenCalledWith({
+        server_uuid: ids.server_uuid,
+        project_uuid: ids.project_uuid,
+        environment_uuid: ids.environment_uuid,
+        destination_uuid: ids.destination_uuid,
+        name: 'managed_data',
+        postgres_db: 'managed_data',
+        image: 'postgres:16',
+        instant_deploy: true,
+      });
+      expect(listStorage).toHaveBeenCalledWith(ids.database_uuid);
+      expect(createStorage).toHaveBeenCalledWith(ids.database_uuid, {
+        type: 'persistent',
+        name: 'managed_data-data',
+        mount_path: '/var/lib/postgresql/data',
+      });
+      expect(createVariable).toHaveBeenCalledWith(ids.application_uuid, {
+        key: 'MANAGED_DATABASE_URL',
+        value: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+        is_buildtime: false,
+        is_runtime: true,
+      });
+      expect(body).toEqual({
+        database_uuid: ids.database_uuid,
+        database_name: 'managed_data',
+        database_status: 'running:healthy',
+        application_uuid: ids.application_uuid,
+        environment_variable_key: 'MANAGED_DATABASE_URL',
+        variable_attached: true,
+        created_or_reused: 'created',
+        redeploy_required: true,
+        operation_status: 'completed',
+      });
+      expect(text).not.toContain('super-secret');
+      expect(text).not.toContain('postgresql://');
+    });
+
+    it('reuses an exact compatible database and updates an existing attachment', async () => {
+      mockPreflight(server, [
+        { uuid: ids.database_uuid, name: 'managed_data', type: 'postgresql' },
+      ]);
+      const database = readyDatabase();
+      jest.spyOn(server['client'], 'getDatabase').mockResolvedValue(database as never);
+      jest.spyOn(server['client'], 'listDatabaseStorages').mockResolvedValue({
+        persistent_storages: [{ mount_path: '/var/lib/postgresql/data' }],
+        file_storages: [],
+      } as never);
+      const createDatabase = jest.spyOn(server['client'], 'createPostgresql');
+      const updateVariable = jest
+        .spyOn(server['client'], 'updateApplicationEnvVar')
+        .mockResolvedValue({ message: 'updated' });
+      jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValueOnce([
+          { key: 'MANAGED_DATABASE_URL', is_runtime: false, is_buildtime: true },
+        ] as never)
+        .mockResolvedValueOnce([
+          { key: 'MANAGED_DATABASE_URL', is_runtime: true, is_buildtime: false },
+        ] as never);
+
+      const result = await callProvision(server, { ...baseArgs, dry_run: false, apply: true });
+      const body = JSON.parse(result.content[0]!.text);
+
+      expect(createDatabase).not.toHaveBeenCalled();
+      expect(updateVariable).toHaveBeenCalledWith(ids.application_uuid, {
+        key: 'MANAGED_DATABASE_URL',
+        value: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+        is_buildtime: false,
+        is_runtime: true,
+      });
+      expect(body.created_or_reused).toBe('reused');
+      expect(body.variable_attached).toBe(true);
+      expect(result.content[0]!.text).not.toContain('super-secret');
+    });
+
+    it('refuses a conflicting database without deleting or overwriting it', async () => {
+      mockPreflight(server, [
+        { uuid: ids.database_uuid, name: 'managed_data', type: 'postgresql' },
+      ]);
+      jest
+        .spyOn(server['client'], 'getDatabase')
+        .mockResolvedValue(readyDatabase({ postgres_db: 'different_database' }) as never);
+      const createDatabase = jest.spyOn(server['client'], 'createPostgresql');
+      const deleteDatabase = jest.spyOn(server['client'], 'deleteDatabase');
+
+      const result = await callProvision(server, { ...baseArgs, dry_run: false, apply: true });
+
+      expect(result.content[0]!.text).toContain('conflicts with the requested name or placement');
+      expect(createDatabase).not.toHaveBeenCalled();
+      expect(deleteDatabase).not.toHaveBeenCalled();
+    });
+
+    it('redacts generated credentials from attachment failures and preserves retry state', async () => {
+      mockPreflight(server);
+      jest
+        .spyOn(server['client'], 'createPostgresql')
+        .mockResolvedValue({ uuid: ids.database_uuid });
+      jest.spyOn(server['client'], 'getDatabase').mockResolvedValue(readyDatabase() as never);
+      jest.spyOn(server['client'], 'listDatabaseStorages').mockResolvedValue({
+        persistent_storages: [{ mount_path: '/var/lib/postgresql/data' }],
+        file_storages: [],
+      } as never);
+      jest
+        .spyOn(server['client'], 'createApplicationEnvVar')
+        .mockRejectedValue(
+          new Error(
+            'attachment failed password=super-secret postgresql://postgres:super-secret@managed_data:5432/managed_data',
+          ),
+        );
+      const deleteDatabase = jest.spyOn(server['client'], 'deleteDatabase');
+
+      const result = await callProvision(server, { ...baseArgs, dry_run: false, apply: true });
+      const text = result.content[0]!.text;
+
+      expect(text).not.toContain('super-secret');
+      expect(text).not.toContain('postgresql://');
+      expect(text).toContain('attachment failed');
+      expect(deleteDatabase).not.toHaveBeenCalled();
+    });
+
+    it('reports a redacted readiness timeout without deleting the managed database', async () => {
+      jest.useFakeTimers();
+      try {
+        mockPreflight(server);
+        jest
+          .spyOn(server['client'], 'createPostgresql')
+          .mockResolvedValue({ uuid: ids.database_uuid });
+        jest
+          .spyOn(server['client'], 'getDatabase')
+          .mockResolvedValue(readyDatabase({ status: 'starting' }) as never);
+        jest.spyOn(server['client'], 'listDatabaseStorages').mockResolvedValue({
+          persistent_storages: [],
+          file_storages: [],
+        });
+        const deleteDatabase = jest.spyOn(server['client'], 'deleteDatabase');
+
+        const resultPromise = callProvision(server, { ...baseArgs, dry_run: false, apply: true });
+        await jest.advanceTimersByTimeAsync(31_000);
+        const result = await resultPromise;
+
+        expect(result.content[0]!.text).toContain('readiness timed out');
+        expect(deleteDatabase).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('supports explicit application redeployment only after a successful attachment', async () => {
+      mockPreflight(server);
+      jest
+        .spyOn(server['client'], 'createPostgresql')
+        .mockResolvedValue({ uuid: ids.database_uuid });
+      jest.spyOn(server['client'], 'getDatabase').mockResolvedValue(readyDatabase() as never);
+      jest.spyOn(server['client'], 'listDatabaseStorages').mockResolvedValue({
+        persistent_storages: [{ mount_path: '/var/lib/postgresql/data' }],
+        file_storages: [],
+      } as never);
+      jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValueOnce([] as never)
+        .mockResolvedValueOnce([
+          { key: 'MANAGED_DATABASE_URL', is_runtime: true, is_buildtime: false },
+        ] as never);
+      jest
+        .spyOn(server['client'], 'createApplicationEnvVar')
+        .mockResolvedValue({ uuid: 'env-uuid' });
+      const restart = jest
+        .spyOn(server['client'], 'restartApplication')
+        .mockResolvedValue({ message: 'restarted' });
+
+      const result = await callProvision(server, {
+        ...baseArgs,
+        dry_run: false,
+        apply: true,
+        redeploy_application: true,
+      });
+
+      expect(restart).toHaveBeenCalledWith(ids.application_uuid);
+      expect(JSON.parse(result.content[0]!.text).redeploy_required).toBe(false);
     });
   });
 

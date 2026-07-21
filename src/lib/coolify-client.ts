@@ -416,6 +416,15 @@ const MASKED_VALUE = '***';
 
 const SENSITIVE_TEXT_REPLACEMENTS: Array<{ pattern: RegExp; replacement: string }> = [
   {
+    pattern:
+      /((?:"|')?(?:private_key|public_key|passphrase|fingerprint)(?:"|')?\s*:\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,\s}]+)/gi,
+    replacement: '$1***REDACTED KEY MATERIAL***',
+  },
+  {
+    pattern: /\bpostgres(?:ql)?:\/\/[^\s"'`]+/gi,
+    replacement: '***REDACTED POSTGRES CONNECTION URL***',
+  },
+  {
     pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
     replacement: '***REDACTED PRIVATE KEY***',
   },
