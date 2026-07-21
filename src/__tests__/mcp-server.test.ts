@@ -1382,20 +1382,27 @@ describe('CoolifyMcpServer v2', () => {
     });
 
     it('previews deletion, enforces exact name, and blocks active deployments', async () => {
-      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
-        uuid: ids.application_uuid,
-        name: 'private-repo-app',
-        git_repository: createArgs.git_repository,
-        git_branch: 'main',
-        status: 'exited:unhealthy',
-        fqdn: 'https://private.example.com',
-      } as never);
+      let applicationExists = true;
+      jest.spyOn(server['client'], 'getApplication').mockImplementation(async () => {
+        if (!applicationExists) throw new Error('HTTP 404: not found');
+        return {
+          uuid: ids.application_uuid,
+          name: 'private-repo-app',
+          git_repository: createArgs.git_repository,
+          git_branch: 'main',
+          status: 'exited:unhealthy',
+          fqdn: 'https://private.example.com',
+        } as never;
+      });
       const deployments = jest
         .spyOn(server['client'], 'listApplicationDeployments')
         .mockResolvedValue({ count: 0, deployments: [] });
       const deleteSpy = jest
         .spyOn(server['client'], 'deleteApplication')
-        .mockResolvedValue({ message: 'deleted' });
+        .mockImplementation(async () => {
+          applicationExists = false;
+          return { message: 'deleted' };
+        });
 
       const preview = (await toolHandler('delete_application')(
         {
@@ -1409,17 +1416,25 @@ describe('CoolifyMcpServer v2', () => {
       expect(body.deletion_started).toBe(false);
       expect(deleteSpy).not.toHaveBeenCalled();
 
-      await toolHandler('delete_application')(
+      const deleted = (await toolHandler('delete_application')(
         {
           application_uuid: ids.application_uuid,
           expected_name: 'private-repo-app',
           execute: true,
         },
         {},
-      );
+      )) as { content: Array<{ text: string }> };
+      const deletedBody = JSON.parse(deleted.content[0]!.text);
+      expect(deletedBody.deleted).toBe(true);
+      expect(deletedBody.verification).toMatchObject({
+        ok: true,
+        status: 'not_found',
+        exists: false,
+      });
       expect(deleteSpy).toHaveBeenCalledTimes(1);
       expect(deleteSpy).toHaveBeenCalledWith(ids.application_uuid);
 
+      applicationExists = true;
       const mismatch = (await toolHandler('delete_application')(
         {
           application_uuid: ids.application_uuid,
@@ -1447,6 +1462,63 @@ describe('CoolifyMcpServer v2', () => {
       expect(deleteSpy).toHaveBeenCalledTimes(1);
     });
 
+    it('does not claim deletion when the exact application still exists', async () => {
+      jest.spyOn(server['client'], 'getApplication').mockResolvedValue({
+        uuid: ids.application_uuid,
+        name: 'private-repo-app',
+      } as never);
+      jest
+        .spyOn(server['client'], 'listApplicationDeployments')
+        .mockResolvedValue({ count: 0, deployments: [] });
+      const deleteSpy = jest
+        .spyOn(server['client'], 'deleteApplication')
+        .mockResolvedValue({ message: 'deleted' });
+
+      const result = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(result.content[0]!.text);
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(body.deleted).toBe(false);
+      expect(body.operation_status).toBe('verification_failed');
+      expect(body.verification).toMatchObject({ ok: false, status: 'still_exists', exists: true });
+    });
+
+    it('does not claim deletion when the read-back fails unexpectedly', async () => {
+      jest
+        .spyOn(server['client'], 'getApplication')
+        .mockResolvedValueOnce({ uuid: ids.application_uuid, name: 'private-repo-app' } as never)
+        .mockRejectedValueOnce(new Error('HTTP 500: Coolify read-back unavailable'));
+      jest
+        .spyOn(server['client'], 'listApplicationDeployments')
+        .mockResolvedValue({ count: 0, deployments: [] });
+      const deleteSpy = jest
+        .spyOn(server['client'], 'deleteApplication')
+        .mockResolvedValue({ message: 'deleted' });
+
+      const result = (await toolHandler('delete_application')(
+        {
+          application_uuid: ids.application_uuid,
+          expected_name: 'private-repo-app',
+          execute: true,
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+      const body = JSON.parse(result.content[0]!.text);
+      expect(deleteSpy).toHaveBeenCalledTimes(1);
+      expect(body.deleted).toBe(false);
+      expect(body.verification).toMatchObject({
+        ok: false,
+        status: 'readback_error',
+        exists: null,
+      });
+    });
+
     it('rejects malformed lifecycle UUIDs before lookup', async () => {
       const getApplication = jest.spyOn(server['client'], 'getApplication');
       const deployResult = (await toolHandler('deploy_application')(
@@ -1468,6 +1540,62 @@ describe('CoolifyMcpServer v2', () => {
       expect(deployResult.content[0]!.text).toContain('not a valid Coolify resource identifier');
       expect(deleteResult.content[0]!.text).toContain('not a valid Coolify resource identifier');
       expect(getApplication).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('list_applications pagination', () => {
+    const toolHandler = () =>
+      (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+          >;
+        }
+      )._registeredTools.list_applications!.handler;
+
+    const callList = async (args: Record<string, unknown>) => {
+      const result = (await toolHandler()(args, {})) as { content: Array<{ text: string }> };
+      return JSON.parse(result.content[0]!.text) as {
+        data: Array<{ uuid: string }>;
+        pagination: { page: number; per_page: number; total: number; has_next: boolean };
+        _pagination?: { next?: unknown; prev?: unknown };
+      };
+    };
+
+    it('returns first, second, and last pages with accurate next metadata', async () => {
+      jest
+        .spyOn(server['client'], 'listApplications')
+        .mockResolvedValue(['a', 'b', 'c'].map((uuid) => ({ uuid, name: uuid })) as never);
+      const first = await callList({ page: 1, per_page: 1 });
+      const second = await callList({ page: 2, per_page: 1 });
+      const last = await callList({ page: 3, per_page: 1 });
+      expect(first.data).toHaveLength(1);
+      expect(first.data[0]!.uuid).toBe('a');
+      expect(first.pagination.has_next).toBe(true);
+      expect(first._pagination?.next).toBeDefined();
+      expect(second.data[0]!.uuid).toBe('b');
+      expect(second._pagination?.prev).toBeDefined();
+      expect(second._pagination?.next).toBeDefined();
+      expect(last.data[0]!.uuid).toBe('c');
+      expect(last.pagination.has_next).toBe(false);
+      expect(last._pagination?.next).toBeUndefined();
+    });
+
+    it('bounds excessive page sizes and returns an empty page without a next link', async () => {
+      jest
+        .spyOn(server['client'], 'listApplications')
+        .mockResolvedValue([{ uuid: 'a', name: 'a' }] as never);
+      const bounded = await callList({ page: 1, per_page: 100000 });
+      expect(bounded.pagination.per_page).toBe(100);
+      expect(bounded.data).toHaveLength(1);
+      const empty = await callList({ page: 1, per_page: 1 });
+      jest.spyOn(server['client'], 'listApplications').mockResolvedValue([] as never);
+      const noResults = await callList({ page: 1, per_page: 1 });
+      expect(empty.pagination.has_next).toBe(false);
+      expect(noResults.data).toEqual([]);
+      expect(noResults.pagination).toMatchObject({ total: 0, has_next: false });
+      expect(noResults._pagination).toBeUndefined();
     });
   });
 

@@ -46,6 +46,8 @@ const CREATE_APPLICATION_BUILD_PACKS = [
   'dockerfile',
   'dockercompose',
 ] as const;
+const DEFAULT_APPLICATION_PAGE_SIZE = 50;
+const MAX_APPLICATION_PAGE_SIZE = 100;
 
 interface CreateApplicationToolArgs {
   name?: string;
@@ -69,6 +71,50 @@ interface CreateApplicationToolArgs {
 
 function isSafeCoolifyResourceId(value: string): boolean {
   return COOLIFY_RESOURCE_ID.test(value.trim());
+}
+
+export function normalizeApplicationPagination(
+  page?: number,
+  perPage?: number,
+): {
+  page: number;
+  per_page: number;
+} {
+  const normalizedPage = Number.isFinite(page) ? Math.max(1, Math.floor(page!)) : 1;
+  const normalizedPerPage = Number.isFinite(perPage)
+    ? Math.min(MAX_APPLICATION_PAGE_SIZE, Math.max(1, Math.floor(perPage!)))
+    : DEFAULT_APPLICATION_PAGE_SIZE;
+  return { page: normalizedPage, per_page: normalizedPerPage };
+}
+
+function isNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:\b404\b|not found|could not be found)/i.test(message);
+}
+
+async function verifyApplicationDeleted(
+  client: CoolifyClient,
+  applicationUuid: string,
+): Promise<Record<string, unknown>> {
+  try {
+    await client.getApplication(applicationUuid);
+    return {
+      ok: false,
+      status: 'still_exists',
+      exists: true,
+      message: 'Coolify still returned the application after deletion.',
+    };
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return { ok: true, status: 'not_found', exists: false };
+    }
+    return {
+      ok: false,
+      status: 'readback_error',
+      exists: null,
+      error: client.sanitizeError(error),
+    };
+  }
 }
 
 function hasControlCharacter(value: string): boolean {
@@ -1305,13 +1351,59 @@ export class CoolifyMcpServer extends McpServer {
       'list_applications',
       'List apps (summary)',
       { page: z.number().optional(), per_page: z.number().optional() },
-      async ({ page, per_page }) =>
-        wrapWithActions(
-          () => this.client.listApplications({ page, per_page, summary: true }),
-          undefined,
-          (result) =>
-            getPagination('list_applications', page, per_page, (result as unknown[]).length),
-        ),
+      async ({ page, per_page }) => {
+        const pagination = normalizeApplicationPagination(page, per_page);
+        try {
+          // Coolify deployments have returned the complete collection while
+          // still advertising pagination headers. Slice locally so the MCP
+          // contract is deterministic even when the upstream ignores query
+          // parameters, and derive next/prev from the complete bounded set.
+          const listed = await this.client.listApplications({ summary: true });
+          const applications = Array.isArray(listed) ? listed : [];
+          const start = (pagination.page - 1) * pagination.per_page;
+          const data = applications.slice(start, start + pagination.per_page);
+          const hasNext = start + data.length < applications.length;
+          const response: Record<string, unknown> = {
+            data,
+            pagination: {
+              page: pagination.page,
+              per_page: pagination.per_page,
+              total: applications.length,
+              has_next: hasNext,
+            },
+          };
+          if (pagination.page > 1) {
+            response._pagination = {
+              prev: {
+                tool: 'list_applications',
+                args: { page: pagination.page - 1, per_page: pagination.per_page },
+              },
+              ...(hasNext
+                ? {
+                    next: {
+                      tool: 'list_applications',
+                      args: { page: pagination.page + 1, per_page: pagination.per_page },
+                    },
+                  }
+                : {}),
+            };
+          } else if (hasNext) {
+            response._pagination = {
+              next: {
+                tool: 'list_applications',
+                args: { page: pagination.page + 1, per_page: pagination.per_page },
+              },
+            };
+          }
+          return { content: [{ type: 'text' as const, text: JSON.stringify(response, null, 2) }] };
+        } catch (error) {
+          return {
+            content: [
+              { type: 'text' as const, text: `Error: ${this.client.sanitizeError(error)}` },
+            ],
+          };
+        }
+      },
     );
 
     this.tool(
@@ -1802,6 +1894,31 @@ export class CoolifyMcpServer extends McpServer {
             );
           }
           await this.client.deleteApplication(applicationUuid);
+          const verification = await verifyApplicationDeleted(this.client, applicationUuid);
+          if (verification.ok !== true) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(
+                    {
+                      mode: 'execute',
+                      execute: true,
+                      application_uuid: applicationUuid,
+                      name: expectedName,
+                      deleted: false,
+                      operation_status: 'verification_failed',
+                      verification,
+                      message:
+                        'Deletion request completed, but exact read-back did not verify removal.',
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
           return {
             content: [
               {
@@ -1814,6 +1931,7 @@ export class CoolifyMcpServer extends McpServer {
                     name: expectedName,
                     deleted: true,
                     operation_status: 'deleted',
+                    verification,
                     message: 'Exactly one application deletion request completed.',
                   },
                   null,
