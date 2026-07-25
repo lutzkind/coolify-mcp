@@ -2211,7 +2211,7 @@ export class CoolifyMcpServer extends McpServer {
               destination_uuid: destinationUuid,
               name: databaseName,
               postgres_db: databaseName,
-              image: `postgres:${postgresVersion}`,
+              image: databaseImage,
               instant_deploy: true,
             });
             if (
