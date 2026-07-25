@@ -295,6 +295,20 @@ const PROVISION_POSTGRES_DEFAULT_VERSION = '16';
 const PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE = '10Gi';
 const PROVISION_POSTGRES_READY_TIMEOUT_MS = 30_000;
 const PROVISION_POSTGRES_POLL_INTERVAL_MS = 1_000;
+const OSM_SIDECAR_DATABASE_NAME = 'osm_lead_source';
+const OSM_SIDECAR_VARIABLE_KEY = 'OSM_LEAD_SOURCE_PRODUCTION_DATABASE_URL';
+const OSM_SIDECAR_POSTGIS_VERSION = '3.5';
+
+export function provisionPostgresImage(
+  databaseName: string,
+  variableKey: string,
+  postgresVersion: string,
+): string {
+  if (databaseName === OSM_SIDECAR_DATABASE_NAME && variableKey === OSM_SIDECAR_VARIABLE_KEY) {
+    return `postgis/postgis:${postgresVersion}-${OSM_SIDECAR_POSTGIS_VERSION}`;
+  }
+  return `postgres:${postgresVersion}`;
+}
 
 export interface ProvisionApplicationPostgresToolArgs {
   application_uuid?: string;
@@ -1994,6 +2008,7 @@ export class CoolifyMcpServer extends McpServer {
         const environmentUuid = args.environment_uuid?.trim();
         const environmentName = args.environment_name?.trim();
         const postgresVersion = args.postgres_version?.trim() || PROVISION_POSTGRES_DEFAULT_VERSION;
+        const databaseImage = provisionPostgresImage(databaseName, variableKey, postgresVersion);
         const storageSize = args.storage_size?.trim() || PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE;
         const apply = args.apply === true;
         const secrets: string[] = [];
@@ -2103,7 +2118,16 @@ export class CoolifyMcpServer extends McpServer {
             const sameServer = destinationServerUuidOf(candidate) === serverUuid;
             const sameProject =
               typeof candidate.project_uuid !== 'string' || candidate.project_uuid === projectUuid;
-            if (!exactName || !sameEnvironment || !sameDestination || !sameServer || !sameProject) {
+            const sameImage =
+              typeof candidate.image !== 'string' || candidate.image === databaseImage;
+            if (
+              !exactName ||
+              !sameEnvironment ||
+              !sameDestination ||
+              !sameServer ||
+              !sameProject ||
+              !sameImage
+            ) {
               throw new Error(
                 'an existing database conflicts with the requested name or placement; refusing to overwrite it',
               );
@@ -2144,6 +2168,7 @@ export class CoolifyMcpServer extends McpServer {
                       apply: false,
                       database_uuid: existingDatabase?.uuid ?? null,
                       database_name: databaseName,
+                      database_image: databaseImage,
                       database_status: existingDatabase
                         ? safeProvisionDatabaseStatus(existingDatabase)
                         : 'not_created',
@@ -2184,7 +2209,7 @@ export class CoolifyMcpServer extends McpServer {
               destination_uuid: destinationUuid,
               name: databaseName,
               postgres_db: databaseName,
-              image: `postgres:${postgresVersion}`,
+              image: databaseImage,
               instant_deploy: true,
             });
             if (
