@@ -2170,6 +2170,7 @@ export class CoolifyMcpServer extends McpServer {
                       apply: false,
                       database_uuid: existingDatabase?.uuid ?? null,
                       database_name: databaseName,
+                      database_image: databaseImage,
                       database_status: existingDatabase
                         ? safeProvisionDatabaseStatus(existingDatabase)
                         : 'not_created',
