@@ -2121,9 +2121,17 @@ export class CoolifyMcpServer extends McpServer {
             const sameServer = destinationServerUuidOf(candidate) === serverUuid;
             const sameProject =
               typeof candidate.project_uuid !== 'string' || candidate.project_uuid === projectUuid;
-            if (!exactName || !sameEnvironment || !sameDestination || !sameServer || !sameProject) {
+            const sameImage = candidate.image === databaseImage;
+            if (
+              !exactName ||
+              !sameEnvironment ||
+              !sameDestination ||
+              !sameServer ||
+              !sameProject ||
+              !sameImage
+            ) {
               throw new Error(
-                'an existing database conflicts with the requested name or placement; refusing to overwrite it',
+                'an existing database conflicts with the requested name, image, or placement; refusing to overwrite it',
               );
             }
             existingDatabase = candidate;
