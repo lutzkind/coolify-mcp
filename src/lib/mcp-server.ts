@@ -2296,6 +2296,7 @@ export class CoolifyMcpServer extends McpServer {
                   {
                     database_uuid: database.uuid,
                     database_name: databaseName,
+                    database_image: databaseImage,
                     database_status: safeProvisionDatabaseStatus(database),
                     application_uuid: applicationUuid,
                     environment_variable_key: variableKey,
