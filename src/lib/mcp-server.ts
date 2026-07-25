@@ -299,7 +299,7 @@ const OSM_SIDECAR_DATABASE_NAME = 'osm_lead_source';
 const OSM_SIDECAR_VARIABLE_KEY = 'OSM_LEAD_SOURCE_PRODUCTION_DATABASE_URL';
 const OSM_SIDECAR_POSTGIS_VERSION = '3.5';
 
-function provisionPostgresImage(
+export function provisionPostgresImage(
   databaseName: string,
   variableKey: string,
   postgresVersion: string,
