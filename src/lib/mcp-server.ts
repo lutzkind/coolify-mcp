@@ -304,10 +304,7 @@ export function provisionPostgresImage(
   variableKey: string,
   postgresVersion: string,
 ): string {
-  if (
-    databaseName === OSM_SIDECAR_DATABASE_NAME &&
-    variableKey === OSM_SIDECAR_VARIABLE_KEY
-  ) {
+  if (databaseName === OSM_SIDECAR_DATABASE_NAME && variableKey === OSM_SIDECAR_VARIABLE_KEY) {
     return `postgis/postgis:${postgresVersion}-${OSM_SIDECAR_POSTGIS_VERSION}`;
   }
   return `postgres:${postgresVersion}`;
