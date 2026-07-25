@@ -11,11 +11,7 @@ describe('provisionPostgresImage', () => {
 
   it('selects the allowlisted PostGIS image for the exact OSM sidecar request', () => {
     expect(
-      provisionPostgresImage(
-        'osm_lead_source',
-        'OSM_LEAD_SOURCE_PRODUCTION_DATABASE_URL',
-        '16',
-      ),
+      provisionPostgresImage('osm_lead_source', 'OSM_LEAD_SOURCE_PRODUCTION_DATABASE_URL', '16'),
     ).toBe('postgis/postgis:16-3.5');
   });
 
@@ -27,11 +23,7 @@ describe('provisionPostgresImage', () => {
 
   it('does not select PostGIS when only the environment key matches', () => {
     expect(
-      provisionPostgresImage(
-        'other_database',
-        'OSM_LEAD_SOURCE_PRODUCTION_DATABASE_URL',
-        '16',
-      ),
+      provisionPostgresImage('other_database', 'OSM_LEAD_SOURCE_PRODUCTION_DATABASE_URL', '16'),
     ).toBe('postgres:16');
   });
 });
