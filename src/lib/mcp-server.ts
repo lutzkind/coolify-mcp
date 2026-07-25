@@ -2011,6 +2011,7 @@ export class CoolifyMcpServer extends McpServer {
         const environmentUuid = args.environment_uuid?.trim();
         const environmentName = args.environment_name?.trim();
         const postgresVersion = args.postgres_version?.trim() || PROVISION_POSTGRES_DEFAULT_VERSION;
+        const databaseImage = provisionPostgresImage(databaseName, variableKey, postgresVersion);
         const storageSize = args.storage_size?.trim() || PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE;
         const apply = args.apply === true;
         const secrets: string[] = [];
