@@ -3073,7 +3073,9 @@ export class CoolifyMcpServer extends McpServer {
       scope: isPreviewEnvEntry(entry) ? 'preview' : 'production',
       is_buildtime: entry.is_buildtime ?? null,
       is_runtime: entry.is_runtime ?? null,
+      is_shown_once: entry.is_shown_once === true,
       has_value: Boolean(entry.value || entry.real_value),
+      value_withheld: entry.is_shown_once === true && !entry.value && !entry.real_value,
       secret_redacted: true,
     });
     this.tool(
