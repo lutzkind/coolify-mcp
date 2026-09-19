@@ -24,7 +24,7 @@ describe('CoolifyMcpServer v2', () => {
   beforeEach(() => {
     server = new CoolifyMcpServer({
       baseUrl: 'http://localhost:3000',
-      accessToken: 'test-token',
+      accessToken: ***REDACTED***,
     });
   });
 
@@ -389,12 +389,21 @@ describe('CoolifyMcpServer v2', () => {
       return (await tool.handler(args, {})) as { content: Array<{ text: string }> };
     };
 
-    it('inspect_env returns only requested keys and redacts values', async () => {
+    it('inspect_env separates production and preview twins without reporting a false duplicate', async () => {
       jest.spyOn(server['client'], 'listApplicationEnvVars').mockResolvedValue([
         {
-          uuid: 'env-1',
+          uuid: 'env-prod',
           key: 'REQUESTED',
           value: 'secret-value',
+          is_preview: false,
+          is_buildtime: false,
+          is_runtime: true,
+        },
+        {
+          uuid: 'env-preview',
+          key: 'REQUESTED',
+          value: 'secret-value',
+          is_preview: true,
           is_buildtime: false,
           is_runtime: true,
         },
@@ -402,6 +411,7 @@ describe('CoolifyMcpServer v2', () => {
           uuid: 'env-2',
           key: 'UNREQUESTED',
           value: 'unrelated',
+          is_preview: false,
           is_buildtime: false,
           is_runtime: true,
         },
@@ -412,10 +422,68 @@ describe('CoolifyMcpServer v2', () => {
         keys: ['REQUESTED'],
       });
       const body = JSON.parse(result.content[0].text);
+      const entry = body.entries[0];
       expect(body.entries).toHaveLength(1);
-      expect(body.entries[0].entries[0].key).toBe('REQUESTED');
+      expect(entry.entries).toHaveLength(2);
+      expect(entry.production_entries).toHaveLength(1);
+      expect(entry.preview_entries).toHaveLength(1);
+      expect(entry.production_entries[0]).toEqual(
+        expect.objectContaining({ key: 'REQUESTED', is_preview: false, scope: 'production' }),
+      );
+      expect(entry.preview_entries[0]).toEqual(
+        expect.objectContaining({ key: 'REQUESTED', is_preview: true, scope: 'preview' }),
+      );
+      expect(entry.duplicate_count).toBe(0);
+      expect(entry.production_duplicate_count).toBe(0);
+      expect(entry.preview_duplicate_count).toBe(0);
+      expect(entry.expected_preview_twin).toBe(true);
+      expect(entry.effective_entry_uuid).toBe('env-prod');
+      expect(entry.effective_production_entry_uuid).toBe('env-prod');
+      expect(entry.effective_preview_entry_uuid).toBe('env-preview');
+      expect(entry.production_preview_value_mismatch).toBe(false);
       expect(JSON.stringify(body)).not.toContain('secret-value');
       expect(JSON.stringify(body)).not.toContain('UNREQUESTED');
+    });
+
+    it('inspect_env still reports genuine duplicates inside one scope', async () => {
+      jest.spyOn(server['client'], 'listApplicationEnvVars').mockResolvedValue([
+        {
+          uuid: 'prod-1',
+          key: 'REQUESTED',
+          value: 'old',
+          is_preview: false,
+          is_buildtime: false,
+          is_runtime: true,
+        },
+        {
+          uuid: 'prod-2',
+          key: 'REQUESTED',
+          value: 'new',
+          is_preview: false,
+          is_buildtime: true,
+          is_runtime: true,
+        },
+        {
+          uuid: 'preview-1',
+          key: 'REQUESTED',
+          value: 'preview',
+          is_preview: true,
+          is_buildtime: false,
+          is_runtime: true,
+        },
+      ] as never);
+      const result = await call('inspect_env', {
+        resource: 'application',
+        uuid: 'abcdefghijklmnopqrstuvwx',
+        keys: ['REQUESTED'],
+      });
+      const entry = JSON.parse(result.content[0].text).entries[0];
+      expect(entry.duplicate_count).toBe(1);
+      expect(entry.production_duplicate_count).toBe(1);
+      expect(entry.preview_duplicate_count).toBe(0);
+      expect(entry.production_conflicting_flags).toBe(true);
+      expect(entry.production_conflicting_values).toBe(true);
+      expect(entry.expected_preview_twin).toBe(false);
     });
 
     it('reconcile_env previews without invoking a mutation', async () => {
@@ -439,6 +507,81 @@ describe('CoolifyMcpServer v2', () => {
         summary: false,
         reveal: true,
       });
+    });
+
+    it('reconcile_env deduplicates production rows without deleting preview twins', async () => {
+      const before = [
+        {
+          uuid: 'prod-old',
+          key: 'REQUESTED',
+          value: 'old',
+          is_preview: false,
+          is_buildtime: false,
+          is_runtime: true,
+        },
+        {
+          uuid: 'prod-current',
+          key: 'REQUESTED',
+          value: 'current',
+          is_preview: false,
+          is_buildtime: false,
+          is_runtime: true,
+        },
+        {
+          uuid: 'preview-current',
+          key: 'REQUESTED',
+          value: 'preview',
+          is_preview: true,
+          is_buildtime: false,
+          is_runtime: true,
+        },
+      ];
+      const after = [
+        {
+          uuid: 'prod-current',
+          key: 'REQUESTED',
+          value: 'new',
+          is_preview: false,
+          is_buildtime: false,
+          is_runtime: true,
+        },
+        before[2],
+      ];
+      jest
+        .spyOn(server['client'], 'listApplicationEnvVars')
+        .mockResolvedValueOnce(before as never)
+        .mockResolvedValueOnce(after as never);
+      const update = jest
+        .spyOn(server['client'], 'updateApplicationEnvVar')
+        .mockResolvedValue({ message: 'Updated' });
+      const remove = jest
+        .spyOn(server['client'], 'deleteApplicationEnvVar')
+        .mockResolvedValue({ message: 'Deleted' });
+
+      const result = await call('reconcile_env', {
+        resource: 'application',
+        uuid: 'abcdefghijklmnopqrstuvwx',
+        keys: ['REQUESTED'],
+        desired_values: { REQUESTED: 'new' },
+        apply: true,
+      });
+      const body = JSON.parse(result.content[0].text);
+
+      expect(update).toHaveBeenCalledWith(
+        'abcdefghijklmnopqrstuvwx',
+        expect.objectContaining({ key: 'REQUESTED', value: 'new', is_preview: false }),
+      );
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledWith('abcdefghijklmnopqrstuvwx', 'prod-old');
+      expect(remove).not.toHaveBeenCalledWith('abcdefghijklmnopqrstuvwx', 'preview-current');
+      expect(body.deleted).toEqual(['prod-old']);
+      expect(body.preserved_preview).toEqual([
+        expect.objectContaining({
+          entry_uuid: 'preview-current',
+          is_preview: true,
+          scope: 'preview',
+        }),
+      ]);
     });
   });
 
@@ -1170,7 +1313,7 @@ describe('CoolifyMcpServer v2', () => {
           uuid: ids.private_key_uuid,
           name: 'repo key',
           description: 'safe description',
-          private_key: '-----BEGIN PRIVATE KEY-----SECRET',
+          private_key: ***REDACTED***,
           public_key: 'ssh-ed25519 PUBLIC',
           fingerprint: 'SHA256:sensitive',
           created_at: '2026-01-01T00:00:00Z',
@@ -1204,7 +1347,7 @@ describe('CoolifyMcpServer v2', () => {
     it('fails safely when private-key listing fails', async () => {
       jest
         .spyOn(server['client'], 'listPrivateKeys')
-        .mockRejectedValue(new Error('upstream private_key=super-secret'));
+        .mockRejectedValue(new Error('upstream private_key=***REDACTED***'));
 
       const result = (await toolHandler('list_private_keys')({}, {})) as {
         content: Array<{ text: string }>;
@@ -1741,7 +1884,7 @@ describe('CoolifyMcpServer v2', () => {
       status: 'running:healthy',
       environment_id: 1,
       destination: { uuid: ids.destination_uuid, server: { uuid: ids.server_uuid } },
-      internal_db_url: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+      internal_db_url: 'postgresql://postgres:[REDACTED]',
       postgres_password: 'super-secret',
       ...overrides,
     });
@@ -1870,7 +2013,7 @@ describe('CoolifyMcpServer v2', () => {
       });
       expect(createVariable).toHaveBeenCalledWith(ids.application_uuid, {
         key: 'MANAGED_DATABASE_URL',
-        value: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+        value: 'postgresql://postgres:[REDACTED]',
         is_buildtime: false,
         is_runtime: true,
       });
@@ -1918,7 +2061,7 @@ describe('CoolifyMcpServer v2', () => {
       expect(createDatabase).not.toHaveBeenCalled();
       expect(updateVariable).toHaveBeenCalledWith(ids.application_uuid, {
         key: 'MANAGED_DATABASE_URL',
-        value: 'postgresql://postgres:super-secret@managed_data:5432/managed_data',
+        value: 'postgresql://postgres:[REDACTED]',
         is_buildtime: false,
         is_runtime: true,
       });
@@ -1958,7 +2101,7 @@ describe('CoolifyMcpServer v2', () => {
         .spyOn(server['client'], 'createApplicationEnvVar')
         .mockRejectedValue(
           new Error(
-            'attachment failed password=super-secret postgresql://postgres:super-secret@managed_data:5432/managed_data',
+            'attachment failed password=***REDACTED*** postgresql://postgres:[REDACTED]',
           ),
         );
       const deleteDatabase = jest.spyOn(server['client'], 'deleteDatabase');
@@ -2038,7 +2181,7 @@ describe('CoolifyMcpServer v2', () => {
     // Regression for #232: `deployment {action: get, lines: N}` used to call
     // getDeployment(uuid, { includeLogs: true }) and spread the RAW upstream
     // payload into the response — leaking the destination server's
-    // logdrain_custom_config bearer token, sentinel_token, webhook secrets,
+    // logdrain_custom_config bearer [REDACTED], sentinel_token, webhook secrets,
     // and the full docker_compose/application graph. It must now always go
     // through toDeploymentEssential(), with only the (string) logs attached.
 
@@ -2123,7 +2266,7 @@ describe('CoolifyMcpServer v2', () => {
             uuid: 'server-uuid',
             ip: '1.2.3.4',
             settings: {
-              logdrain_custom_config: 'Bearer live-logdrain-token-abc123',
+              logdrain_custom_config: 'Bearer [REDACTED]',
               sentinel_token: 'live-sentinel-token-xyz789',
             },
             proxy: { config: 'y'.repeat(3000) },
@@ -2508,7 +2651,7 @@ describe('CoolifyMcpServer v2', () => {
               logs: JSON.stringify([{ output: 'build failed: OOM', timestamp: 't1' }]),
               // Fields that would only appear on the raw upstream object —
               // must never leak into the tool response.
-              server: { ip: '10.0.0.1', private_key: 'super-secret' },
+              server: { ip: '10.0.0.1', private_key: ***REDACTED*** },
               application: { env_secret: 'shh' },
             } as never;
           }
@@ -2904,11 +3047,11 @@ describe('summarizeDeploymentForRead', () => {
     };
 
     const result = summarizeDeploymentForRead(raw, {
-      logs: 'Bearer ***REDACTED***',
+      logs: 'Bearer [REDACTED]',
       logs_meta: { total_entries: 20, showing: '1-20 of 20', chars: 21 },
     });
 
-    expect(result.logs).toBe('Bearer ***REDACTED***');
+    expect(result.logs).toBe('Bearer [REDACTED]');
     expect(result.logs_meta).toEqual({
       total_entries: 20,
       showing: '1-20 of 20',
@@ -2922,7 +3065,7 @@ describe('summarizeDeploymentForRead', () => {
 describe('filterLogText', () => {
   it('filters logs, removes ANSI, applies context, and redacts secrets', () => {
     const result = filterLogText(
-      '\u001b[31mINFO start\u001b[0m\nWARNING Authorization: Bearer secret-value-long\nERROR failed\nINFO done',
+      '\u001b[31mINFO start\u001b[0m\nWARNING Authorization: Bearer [REDACTED] failed\nINFO done',
       {
         search: 'error',
         context_before: 1,
