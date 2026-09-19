@@ -3059,7 +3059,11 @@ export class CoolifyMcpServer extends McpServer {
       warnings,
       audit_id: crypto.randomUUID(),
     });
-    const isPreviewEnvEntry = (entry: Record<string, unknown>) => entry.is_preview === true;
+    const isPreviewEnvEntry = (entry: Record<string, unknown>) =>
+      entry.is_preview === true ||
+      entry.is_preview === 1 ||
+      entry.is_preview === '1' ||
+      entry.is_preview === 'true';
     const envEntryValue = (entry: Record<string, unknown>): unknown =>
       entry.real_value ?? entry.value ?? null;
     const safeEnvEntry = (entry: Record<string, unknown>) => ({
@@ -3127,8 +3131,7 @@ export class CoolifyMcpServer extends McpServer {
                 Boolean(effectiveProduction) &&
                 Boolean(effectivePreview) &&
                 envEntryValue(effectiveProduction) !== envEntryValue(effectivePreview),
-              expected_preview_twin:
-                productionMatches.length === 1 && previewMatches.length === 1,
+              expected_preview_twin: productionMatches.length === 1 && previewMatches.length === 1,
               effective_entry_uuid: effectiveProduction?.uuid ?? null,
               effective_production_entry_uuid: effectiveProduction?.uuid ?? null,
               effective_preview_entry_uuid: effectivePreview?.uuid ?? null,
@@ -3173,10 +3176,7 @@ export class CoolifyMcpServer extends McpServer {
           for (const entry of all) {
             if (!requestedKeys.includes(String(entry.key))) continue;
             const targetMap = isPreviewEnvEntry(entry) ? previewByKey : byKey;
-            targetMap.set(String(entry.key), [
-              ...(targetMap.get(String(entry.key)) ?? []),
-              entry,
-            ]);
+            targetMap.set(String(entry.key), [...(targetMap.get(String(entry.key)) ?? []), entry]);
           }
           const retained: Record<string, unknown>[] = [],
             created: string[] = [],
@@ -3218,6 +3218,13 @@ export class CoolifyMcpServer extends McpServer {
               deleted,
               note: 'No changes were made. Re-run with apply=true. Preview rows are preserved.',
             };
+          for (const key of requestedKeys) {
+            const matches = byKey.get(key) ?? [];
+            if (matches.slice(0, -1).some((entry) => !entry.uuid))
+              throw new Error(
+                `PRODUCTION_STATE_AMBIGUOUS: production duplicate for key ${key} has no entry uuid; refusing to mutate`,
+              );
+          }
           const methods = {
             application: {
               create: (key: string, value: string, entry?: Record<string, unknown>) =>
@@ -3262,9 +3269,9 @@ export class CoolifyMcpServer extends McpServer {
           for (const key of requestedKeys) {
             const matches = byKey.get(key) ?? [];
             const canonical = matches[matches.length - 1];
-            if (desired[key] !== undefined) await methods.create(key, desired[key], canonical);
             for (const duplicate of matches.slice(0, -1))
               if (duplicate.uuid) await methods.delete(String(duplicate.uuid));
+            if (desired[key] !== undefined) await methods.create(key, desired[key], canonical);
           }
           const finalEntries = await listEnvEntries(resource, uuid);
           const remaining = finalEntries.filter(
