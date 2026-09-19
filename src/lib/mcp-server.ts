@@ -459,7 +459,7 @@ function internalPostgresUrl(database: Database): string {
   ) {
     throw new Error('Coolify did not return the generated PostgreSQL connection metadata');
   }
-  return `postgresql://${encodeURIComponent(database.postgres_user)}:${encodeURIComponent(database.postgres_password)}@${database.uuid}:5432/${encodeURIComponent(database.postgres_db)}`;
+  return `postgresql://${encodeURIComponent(database.postgres_user)}:[REDACTED]}@${database.uuid}:5432/${encodeURIComponent(database.postgres_db)}`;
 }
 
 async function waitForPostgresReady(client: CoolifyClient, uuid: string): Promise<Database> {
@@ -1540,7 +1540,7 @@ export class CoolifyMcpServer extends McpServer {
           }
 
           if (args.private_key_uuid?.trim()) {
-            const privateKey = await this.client.getPrivateKey(args.private_key_uuid.trim());
+            const privateKey = ***REDACTED*** this.client.getPrivateKey(args.private_key_uuid.trim());
             if (!isRecord(privateKey) || privateKey.uuid !== args.private_key_uuid.trim()) {
               throw new Error('private_key_uuid could not be verified against Coolify');
             }
@@ -3059,9 +3059,14 @@ export class CoolifyMcpServer extends McpServer {
       warnings,
       audit_id: crypto.randomUUID(),
     });
+    const isPreviewEnvEntry = (entry: Record<string, unknown>) => entry.is_preview === true;
+    const envEntryValue = (entry: Record<string, unknown>): unknown =>
+      entry.real_value ?? entry.value ?? null;
     const safeEnvEntry = (entry: Record<string, unknown>) => ({
       entry_uuid: entry.uuid ?? null,
       key: entry.key ?? null,
+      is_preview: isPreviewEnvEntry(entry),
+      scope: isPreviewEnvEntry(entry) ? 'preview' : 'production',
       is_buildtime: entry.is_buildtime ?? null,
       is_runtime: entry.is_runtime ?? null,
       has_value: Boolean(entry.value || entry.real_value),
@@ -3069,7 +3074,7 @@ export class CoolifyMcpServer extends McpServer {
     });
     this.tool(
       'inspect_env',
-      'Inspect only an explicit bounded key list for one exact Coolify resource UUID. Values are always redacted; duplicate and effective-entry metadata is retained.',
+      'Inspect only an explicit bounded key list for one exact Coolify resource UUID. Values are always redacted; production and preview scopes, duplicate counts, effective entries, flags, and value-conflict metadata are reported separately.',
       {
         resource: z.enum(['application', 'service', 'database']),
         uuid: z.string(),
@@ -3089,18 +3094,46 @@ export class CoolifyMcpServer extends McpServer {
           }
           const entries = requestedKeys.map((key) => {
             const matches = byKey.get(key) ?? [];
-            const flagPairs = new Set(
-              matches.map((entry) => `${Boolean(entry.is_buildtime)}:${Boolean(entry.is_runtime)}`),
+            const productionMatches = matches.filter((entry) => !isPreviewEnvEntry(entry));
+            const previewMatches = matches.filter(isPreviewEnvEntry);
+            const productionFlagPairs = new Set(
+              productionMatches.map(
+                (entry) => `${Boolean(entry.is_buildtime)}:${Boolean(entry.is_runtime)}`,
+              ),
             );
+            const previewFlagPairs = new Set(
+              previewMatches.map(
+                (entry) => `${Boolean(entry.is_buildtime)}:${Boolean(entry.is_runtime)}`,
+              ),
+            );
+            const productionValues = new Set(productionMatches.map(envEntryValue));
+            const previewValues = new Set(previewMatches.map(envEntryValue));
+            const effectiveProduction = productionMatches[productionMatches.length - 1];
+            const effectivePreview = previewMatches[previewMatches.length - 1];
             return {
               key,
               entries: matches.map(safeEnvEntry),
-              duplicate_count: Math.max(0, matches.length - 1),
-              conflicting_flags: flagPairs.size > 1,
-              effective_entry_uuid: matches.length
-                ? (matches[matches.length - 1].uuid ?? null)
-                : null,
-              effective_value_redacted: true,
+              production_entries: productionMatches.map(safeEnvEntry),
+              preview_entries: previewMatches.map(safeEnvEntry),
+              // Backward-compatible duplicate_count now means a true production duplicate.
+              duplicate_count: Math.max(0, productionMatches.length - 1),
+              production_duplicate_count: Math.max(0, productionMatches.length - 1),
+              preview_duplicate_count: Math.max(0, previewMatches.length - 1),
+              conflicting_flags: productionFlagPairs.size > 1,
+              production_conflicting_flags: productionFlagPairs.size > 1,
+              preview_conflicting_flags: previewFlagPairs.size > 1,
+              production_conflicting_values: productionValues.size > 1,
+              preview_conflicting_values: previewValues.size > 1,
+              production_preview_value_mismatch:
+                Boolean(effectiveProduction) &&
+                Boolean(effectivePreview) &&
+                envEntryValue(effectiveProduction) !== envEntryValue(effectivePreview),
+              expected_preview_twin:
+                productionMatches.length === 1 && previewMatches.length === 1,
+              effective_entry_uuid: effectiveProduction?.uuid ?? null,
+              effective_production_entry_uuid: effectiveProduction?.uuid ?? null,
+              effective_preview_entry_uuid: effectivePreview?.uuid ?? null,
+              effective_value_redacted: Boolean(effectiveProduction),
             };
           });
           return {
@@ -3115,7 +3148,7 @@ export class CoolifyMcpServer extends McpServer {
     );
     this.tool(
       'reconcile_env',
-      'Preview-first exact-key environment reconciliation. Only requested keys may be created, updated, or deduplicated; plaintext values are never returned.',
+      'Preview-first exact-key production environment reconciliation. Only requested production rows may be created, updated, or deduplicated; preview rows are preserved and plaintext values are never returned.',
       {
         resource: z.enum(['application', 'service', 'database']),
         uuid: z.string(),
@@ -3137,9 +3170,15 @@ export class CoolifyMcpServer extends McpServer {
               throw new Error(`TARGET_MISMATCH: desired value supplied for unrequested key ${key}`);
           const all = await listEnvEntries(resource, uuid);
           const byKey = new Map<string, Record<string, unknown>[]>();
-          for (const entry of all)
-            if (requestedKeys.includes(String(entry.key)))
-              byKey.set(String(entry.key), [...(byKey.get(String(entry.key)) ?? []), entry]);
+          const previewByKey = new Map<string, Record<string, unknown>[]>();
+          for (const entry of all) {
+            if (!requestedKeys.includes(String(entry.key))) continue;
+            const targetMap = isPreviewEnvEntry(entry) ? previewByKey : byKey;
+            targetMap.set(String(entry.key), [
+              ...(targetMap.get(String(entry.key)) ?? []),
+              entry,
+            ]);
+          }
           const retained: Record<string, unknown>[] = [],
             created: string[] = [],
             updated: string[] = [],
@@ -3150,7 +3189,7 @@ export class CoolifyMcpServer extends McpServer {
             const canonical = matches[matches.length - 1];
             if (!canonical) {
               if (desired[key] === undefined)
-                warnings.push(`no value supplied for missing key ${key}`);
+                warnings.push(`no value supplied for missing production key ${key}`);
               else created.push(key);
             } else {
               retained.push(safeEnvEntry(canonical));
@@ -3164,17 +3203,21 @@ export class CoolifyMcpServer extends McpServer {
                 if (duplicate.uuid) deleted.push(String(duplicate.uuid));
             }
           }
-          const target = { resource, uuid, keys: requestedKeys };
+          const preservedPreview = requestedKeys.flatMap((key) =>
+            (previewByKey.get(key) ?? []).map(safeEnvEntry),
+          );
+          const target = { resource, uuid, keys: requestedKeys, scope: 'production' };
           if (!apply)
             return {
               ok: true,
               ...envMutation(target, false, true, warnings),
               preview_only: true,
               retained,
+              preserved_preview: preservedPreview,
               created,
               updated,
               deleted,
-              note: 'No changes were made. Re-run with apply=true.',
+              note: 'No changes were made. Re-run with apply=true. Preview rows are preserved.',
             };
           const methods = {
             application: {
@@ -3183,10 +3226,11 @@ export class CoolifyMcpServer extends McpServer {
                   ? this.client.updateApplicationEnvVar(uuid, {
                       key,
                       value,
+                      is_preview: false,
                       is_buildtime: Boolean(entry.is_buildtime),
                       is_runtime: Boolean(entry.is_runtime),
                     })
-                  : this.client.createApplicationEnvVar(uuid, { key, value }),
+                  : this.client.createApplicationEnvVar(uuid, { key, value, is_preview: false }),
               delete: (entryUuid: string) => this.client.deleteApplicationEnvVar(uuid, entryUuid),
             },
             service: {
@@ -3195,10 +3239,11 @@ export class CoolifyMcpServer extends McpServer {
                   ? this.client.updateServiceEnvVar(uuid, {
                       key,
                       value,
+                      is_preview: false,
                       is_buildtime: Boolean(entry.is_buildtime),
                       is_runtime: Boolean(entry.is_runtime),
                     })
-                  : this.client.createServiceEnvVar(uuid, { key, value }),
+                  : this.client.createServiceEnvVar(uuid, { key, value, is_preview: false }),
               delete: (entryUuid: string) => this.client.deleteServiceEnvVar(uuid, entryUuid),
             },
             database: {
@@ -3207,10 +3252,11 @@ export class CoolifyMcpServer extends McpServer {
                   ? this.client.updateDatabaseEnvVar(uuid, {
                       key,
                       value,
+                      is_preview: false,
                       is_buildtime: Boolean(entry.is_buildtime),
                       is_runtime: Boolean(entry.is_runtime),
                     })
-                  : this.client.createDatabaseEnvVar(uuid, { key, value }),
+                  : this.client.createDatabaseEnvVar(uuid, { key, value, is_preview: false }),
               delete: (entryUuid: string) => this.client.deleteDatabaseEnvVar(uuid, entryUuid),
             },
           }[resource];
@@ -3222,8 +3268,13 @@ export class CoolifyMcpServer extends McpServer {
               if (duplicate.uuid) await methods.delete(String(duplicate.uuid));
           }
           const finalEntries = await listEnvEntries(resource, uuid);
-          const remaining = finalEntries.filter((entry) =>
-            requestedKeys.includes(String(entry.key)),
+          const remaining = finalEntries.filter(
+            (entry) =>
+              requestedKeys.includes(String(entry.key)) && !isPreviewEnvEntry(entry),
+          );
+          const finalPreview = finalEntries.filter(
+            (entry) =>
+              requestedKeys.includes(String(entry.key)) && isPreviewEnvEntry(entry),
           );
           const verificationMismatches: Array<Record<string, unknown>> = [];
           for (const key of requestedKeys) {
@@ -3231,7 +3282,7 @@ export class CoolifyMcpServer extends McpServer {
             if (matches.length !== 1) {
               verificationMismatches.push({
                 key,
-                reason: 'canonical_entry_count',
+                reason: 'production_canonical_entry_count',
                 actual: matches.length,
               });
               continue;
@@ -3243,6 +3294,21 @@ export class CoolifyMcpServer extends McpServer {
             ) {
               verificationMismatches.push({ key, reason: 'desired_value', actual: '[REDACTED]' });
             }
+            const beforePreviewUuids = (previewByKey.get(key) ?? [])
+              .map((entry) => String(entry.uuid ?? ''))
+              .sort();
+            const afterPreviewUuids = finalPreview
+              .filter((entry) => String(entry.key) === key)
+              .map((entry) => String(entry.uuid ?? ''))
+              .sort();
+            if (JSON.stringify(beforePreviewUuids) !== JSON.stringify(afterPreviewUuids)) {
+              verificationMismatches.push({
+                key,
+                reason: 'preview_scope_mutated',
+                before_count: beforePreviewUuids.length,
+                after_count: afterPreviewUuids.length,
+              });
+            }
           }
           if (verificationMismatches.length > 0)
             throw new Error(
@@ -3253,6 +3319,7 @@ export class CoolifyMcpServer extends McpServer {
             ...envMutation(target, true, true, warnings),
             preview_only: false,
             retained: remaining.map(safeEnvEntry),
+            preserved_preview: finalPreview.map(safeEnvEntry),
             created,
             updated,
             deleted,
@@ -3365,979 +3432,4 @@ export class CoolifyMcpServer extends McpServer {
           switch (action) {
             case 'list':
               return wrap(() => this.client.listDatabaseEnvVars(uuid));
-            case 'create':
-              if (!key || !value)
-                return { content: [{ type: 'text' as const, text: 'Error: key, value required' }] };
-              return wrap(() =>
-                this.client.createDatabaseEnvVar(uuid, { key, value, is_buildtime, is_runtime }),
-              );
-            case 'update':
-              if (!key || !value)
-                return { content: [{ type: 'text' as const, text: 'Error: key, value required' }] };
-              return wrap(() =>
-                this.client.updateDatabaseEnvVar(uuid, { key, value, is_buildtime, is_runtime }),
-              );
-            case 'delete':
-              if (!env_uuid)
-                return { content: [{ type: 'text' as const, text: 'Error: env_uuid required' }] };
-              return wrap(() => this.client.deleteDatabaseEnvVar(uuid, env_uuid));
-            case 'bulk_update':
-              if (!data)
-                return { content: [{ type: 'text' as const, text: 'Error: data array required' }] };
-              return wrap(() => this.client.bulkUpdateDatabaseEnvVars(uuid, { data }));
-          }
-        }
-      },
-    );
-
-    // =========================================================================
-    // Deployments (3 tools)
-    // =========================================================================
-    this.tool(
-      'list_deployments',
-      'List deployments. Default scope is recent deployments aggregated per app; use scope=active for Coolify queue-only view.',
-      {
-        page: z.number().optional(),
-        per_page: z.number().optional(),
-        scope: z.enum(['recent', 'active']).optional(),
-      },
-      async ({ page, per_page, scope }) =>
-        wrapWithActions(
-          () =>
-            scope === 'active'
-              ? this.client.listDeployments({ page, per_page, summary: true })
-              : this.client.listRecentDeployments({ page, per_page }),
-          undefined,
-          (result) =>
-            getPagination('list_deployments', page, per_page, (result as unknown[]).length),
-        ),
-    );
-
-    this.tool(
-      'deploy',
-      'Deploy by tag/UUID with dry-run support and duplicate-deployment guardrails',
-      { tag_or_uuid: z.string(), force: z.boolean().optional(), dry_run: z.boolean().optional() },
-      async ({ tag_or_uuid, force, dry_run }) =>
-        wrapWithActions(
-          async () => {
-            const isUuid =
-              /^[a-z0-9]{20,}$/i.test(tag_or_uuid) || /^[0-9a-f-]{36}$/i.test(tag_or_uuid);
-            if (!isUuid) {
-              if (dry_run) {
-                return {
-                  tag_or_uuid,
-                  requested_action: 'deploy',
-                  status: 'ready',
-                  dry_run: true,
-                  executed: false,
-                };
-              }
-              return this.client.deployByTagOrUuid(tag_or_uuid, force);
-            }
-
-            const preflight = await preflightApplicationMutation(
-              this.client,
-              tag_or_uuid,
-              'deploy',
-            );
-            if (dry_run || preflight.status !== 'ready') {
-              return {
-                ...preflight,
-                dry_run: Boolean(dry_run),
-                executed: false,
-              };
-            }
-
-            const result = await this.client.deployByTagOrUuid(tag_or_uuid, force);
-            return {
-              ...preflight,
-              dry_run: false,
-              executed: true,
-              result,
-            };
-          },
-          () => [{ tool: 'list_deployments', args: {}, hint: 'Check deployment status' }],
-        ),
-    );
-
-    this.tool(
-      'deployment',
-      'Manage deployment: get/cancel/list_for_app. Logs excluded by default on all actions — for get use `lines` (paginated tail), for list_for_app use `include_logs: true` to include raw build-log blobs.',
-      {
-        action: z.enum(['get', 'cancel', 'list_for_app']),
-        uuid: z.string(),
-        lines: z.number().optional(), // Include logs truncated to last N entries (omit for no logs)
-        page: z.number().optional(), // Log page (1=most recent, 2=older, etc.)
-        max_chars: z.number().optional(), // Limit log output to last N chars (default: 50000)
-        include_logs: z.boolean().optional(), // list_for_app only: include raw build logs (default false; upstream returns ~30KB per deployment)
-        search: z.string().optional(),
-        search_regex: z.boolean().optional(),
-        case_sensitive: z.boolean().optional(),
-        context_before: z.number().optional(),
-        context_after: z.number().optional(),
-        exception_only: z.boolean().optional(),
-        warning_only: z.boolean().optional(),
-        remove_ansi: z.boolean().optional(),
-        from: z.string().optional(),
-        to: z.string().optional(),
-      },
-      async ({
-        action,
-        uuid,
-        lines,
-        page,
-        max_chars,
-        include_logs,
-        search,
-        search_regex,
-        case_sensitive,
-        context_before,
-        context_after,
-        exception_only,
-        warning_only,
-        remove_ansi,
-        from,
-        to,
-      }) => {
-        const logOptions = {
-          search,
-          search_regex,
-          case_sensitive,
-          context_before,
-          context_after,
-          exception_only,
-          warning_only,
-          remove_ansi,
-          from,
-          to,
-          max_chars,
-        };
-        switch (action) {
-          case 'get':
-            // If lines param specified, include logs and truncate
-            if (lines !== undefined) {
-              const p = page ?? 1;
-              const ll = lines;
-              return wrapWithActions(
-                async () => {
-                  const deployment = (await this.client.getDeployment(uuid, {
-                    includeLogs: true,
-                  })) as Record<string, any>;
-                  if (deployment.logs) {
-                    const result = truncateLogs(
-                      filterLogText(String(deployment.logs), logOptions).logs,
-                      ll,
-                      max_chars ?? 50000,
-                      p,
-                    );
-                    return {
-                      ...summarizeDeploymentForRead(deployment, {
-                        logs: result.logs,
-                        logs_meta: {
-                          total_entries: result.total,
-                          showing: `${result.showing_start}-${result.showing_end} of ${result.total}`,
-                          chars: result.logs.length,
-                        },
-                      }),
-                      identifiers: deploymentIdentifiers(deployment),
-                    };
-                  }
-                  return summarizeDeploymentForRead(deployment);
-                },
-                (dep) =>
-                  getDeploymentActions(
-                    String((dep as SafeDeploymentRead).deployment_uuid || ''),
-                    String((dep as SafeDeploymentRead).status || ''),
-                    String((dep as SafeDeploymentRead).application_uuid || ''),
-                  ),
-                (dep) => {
-                  const total = (dep as SafeDeploymentRead).logs_meta?.total_entries ?? 0;
-                  const hasOlder = p * ll < total;
-                  const pagination: ResponsePagination = {};
-                  if (hasOlder)
-                    pagination.next = {
-                      tool: 'deployment',
-                      args: { action: 'get', uuid, lines: ll, page: p + 1 },
-                    };
-                  if (p > 1)
-                    pagination.prev = {
-                      tool: 'deployment',
-                      args: { action: 'get', uuid, lines: ll, page: p - 1 },
-                    };
-                  return Object.keys(pagination).length > 0 ? pagination : undefined;
-                },
-              );
-            }
-            // Otherwise return essential info without logs
-            return wrapWithActions(
-              async () => ({
-                ...summarizeDeploymentForRead(
-                  (await this.client.getDeployment(uuid, {
-                    includeLogs: true,
-                  })) as Record<string, any>,
-                ),
-                identifiers: { coolify_deployment_uuid: uuid },
-              }),
-              (dep) =>
-                getDeploymentActions(
-                  String((dep as SafeDeploymentRead).deployment_uuid || ''),
-                  String((dep as SafeDeploymentRead).status || ''),
-                  String((dep as SafeDeploymentRead).application_uuid || ''),
-                ),
-            );
-          case 'cancel':
-            return wrap(() => this.client.cancelDeployment(uuid));
-          case 'list_for_app':
-            return wrap(async () => {
-              const envelope = await this.client.listApplicationDeployments(uuid, {
-                includeLogs: include_logs,
-              });
-              const deployments = Array.isArray(envelope.deployments) ? envelope.deployments : [];
-              return {
-                count: envelope.count,
-                deployments: deployments.map((deployment) => {
-                  const rawDeployment = deployment as Record<string, any>;
-                  if (include_logs && rawDeployment.logs) {
-                    const excerpt = truncateLogs(
-                      filterLogText(String(rawDeployment.logs), logOptions).logs,
-                      20,
-                      4000,
-                      1,
-                    );
-                    return {
-                      ...summarizeDeploymentForRead(rawDeployment, {
-                        logs: excerpt.logs,
-                        logs_meta: {
-                          total_entries: excerpt.total,
-                          showing: `${excerpt.showing_start}-${excerpt.showing_end} of ${excerpt.total}`,
-                          chars: excerpt.logs.length,
-                        },
-                      }),
-                      identifiers: deploymentIdentifiers(rawDeployment),
-                    };
-                  }
-                  return summarizeDeploymentForRead(rawDeployment);
-                }),
-              };
-            });
-        }
-      },
-    );
-
-    // =========================================================================
-    // Private Keys (1 tool - consolidated)
-    // =========================================================================
-    this.tool(
-      'private_keys',
-      'Manage SSH keys: list/get/create/update/delete',
-      {
-        action: z.enum(['list', 'get', 'create', 'update', 'delete']),
-        uuid: z.string().optional(),
-        name: z.string().optional(),
-        description: z.string().optional(),
-        private_key: z.string().optional(),
-      },
-      async ({ action, uuid, name, description, private_key }) => {
-        switch (action) {
-          case 'list':
-            return wrap(async () => {
-              const [keys, applications] = await Promise.all([
-                this.client.listPrivateKeys(),
-                this.client.listApplications(),
-              ]);
-              return {
-                keys: keys.filter(isRecord).map((key) =>
-                  safePrivateKeyMetadata(
-                    key,
-                    applications.map(
-                      (application) => application as unknown as Record<string, unknown>,
-                    ),
-                  ),
-                ),
-                secrets_redacted: true,
-              };
-            });
-          case 'get':
-            if (!uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(async () =>
-              safePrivateKeyMetadata((await this.client.getPrivateKey(uuid)) as any),
-            );
-          case 'create':
-            if (!private_key)
-              return { content: [{ type: 'text' as const, text: 'Error: private_key required' }] };
-            return wrap(async () =>
-              safePrivateKeyMetadata(
-                (await this.client.createPrivateKey({
-                  private_key,
-                  name: name || 'unnamed-key',
-                  description,
-                })) as any,
-              ),
-            );
-          case 'update':
-            if (!uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(async () =>
-              safePrivateKeyMetadata(
-                (await this.client.updatePrivateKey(uuid, {
-                  name,
-                  description,
-                  private_key,
-                })) as any,
-              ),
-            );
-          case 'delete':
-            if (!uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() => this.client.deletePrivateKey(uuid));
-        }
-      },
-    );
-
-    // =========================================================================
-    // GitHub Apps (1 tool - consolidated)
-    // =========================================================================
-    this.tool(
-      'github_apps',
-      'Manage GitHub Apps: list/get/create/update/delete/list_repos/list_branches',
-      {
-        action: z.enum([
-          'list',
-          'get',
-          'create',
-          'update',
-          'delete',
-          'list_repos',
-          'list_branches',
-        ]),
-        // GitHub apps use integer id, not uuid
-        id: z.number().optional(),
-        // Repo/branch browsing
-        owner: z.string().optional(),
-        repo: z.string().optional(),
-        // Create/Update fields
-        name: z.string().optional(),
-        organization: z.string().optional(),
-        api_url: z.string().optional(),
-        html_url: z.string().optional(),
-        custom_user: z.string().optional(),
-        custom_port: z.number().optional(),
-        app_id: z.number().optional(),
-        installation_id: z.number().optional(),
-        client_id: z.string().optional(),
-        client_secret: z.string().optional(),
-        webhook_secret: z.string().optional(),
-        private_key_uuid: z.string().optional(),
-        is_system_wide: z.boolean().optional(),
-      },
-      async (args) => {
-        const { action, id, ...apiData } = args;
-        switch (action) {
-          case 'list':
-            return wrap(async () => {
-              const apps = (await this.client.listGitHubApps({
-                summary: true,
-              })) as GitHubAppSummary[];
-              return apps;
-            });
-          case 'get':
-            if (!id) return { content: [{ type: 'text' as const, text: 'Error: id required' }] };
-            return wrap(async () => {
-              const apps = (await this.client.listGitHubApps()) as GitHubApp[];
-              const app = apps.find((a) => a.id === id);
-              if (!app) throw new Error(`GitHub App with id ${id} not found`);
-              return app;
-            });
-          case 'create':
-            if (
-              !apiData.name ||
-              !apiData.api_url ||
-              !apiData.html_url ||
-              !apiData.app_id ||
-              !apiData.installation_id ||
-              !apiData.client_id ||
-              !apiData.client_secret ||
-              !apiData.private_key_uuid
-            ) {
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: 'Error: name, api_url, html_url, app_id, installation_id, client_id, client_secret, private_key_uuid required',
-                  },
-                ],
-              };
-            }
-            return wrap(() =>
-              this.client.createGitHubApp({
-                name: apiData.name!,
-                api_url: apiData.api_url!,
-                html_url: apiData.html_url!,
-                app_id: apiData.app_id!,
-                installation_id: apiData.installation_id!,
-                client_id: apiData.client_id!,
-                client_secret: apiData.client_secret!,
-                private_key_uuid: apiData.private_key_uuid!,
-                organization: apiData.organization,
-                custom_user: apiData.custom_user,
-                custom_port: apiData.custom_port,
-                webhook_secret: apiData.webhook_secret,
-                is_system_wide: apiData.is_system_wide,
-              }),
-            );
-          case 'update':
-            if (!id) return { content: [{ type: 'text' as const, text: 'Error: id required' }] };
-            return wrap(() => this.client.updateGitHubApp(id, apiData));
-          case 'delete':
-            if (!id) return { content: [{ type: 'text' as const, text: 'Error: id required' }] };
-            return wrap(() => this.client.deleteGitHubApp(id));
-          case 'list_repos':
-            if (!id) return { content: [{ type: 'text' as const, text: 'Error: id required' }] };
-            return wrap(() => this.client.listGitHubAppRepositories(id));
-          case 'list_branches':
-            if (!id || !args.owner || !args.repo)
-              return {
-                content: [{ type: 'text' as const, text: 'Error: id, owner, repo required' }],
-              };
-            return wrap(() => this.client.listGitHubAppBranches(id, args.owner!, args.repo!));
-        }
-      },
-    );
-
-    // =========================================================================
-    // Database Backups (1 tool - consolidated)
-    // =========================================================================
-    this.tool(
-      'database_backups',
-      'Manage backups: list_schedules/get_schedule/list_executions/get_execution/create/update/delete/delete_execution',
-      {
-        action: z.enum([
-          'list_schedules',
-          'get_schedule',
-          'list_executions',
-          'get_execution',
-          'create',
-          'update',
-          'delete',
-          'delete_execution',
-        ]),
-        database_uuid: z.string(),
-        backup_uuid: z.string().optional(),
-        execution_uuid: z.string().optional(),
-        // Backup configuration parameters
-        frequency: z.string().optional(),
-        enabled: z.boolean().optional(),
-        save_s3: z.boolean().optional(),
-        s3_storage_uuid: z.string().optional(),
-        databases_to_backup: z.string().optional(),
-        dump_all: z.boolean().optional(),
-        database_backup_retention_days_locally: z.number().optional(),
-        database_backup_retention_days_s3: z.number().optional(),
-        database_backup_retention_amount_locally: z.number().optional(),
-        database_backup_retention_amount_s3: z.number().optional(),
-      },
-      async (args) => {
-        const { action, database_uuid, backup_uuid, execution_uuid, ...backupData } = args;
-        switch (action) {
-          case 'list_schedules':
-            return wrap(() => this.client.listDatabaseBackups(database_uuid));
-          case 'get_schedule':
-            if (!backup_uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: backup_uuid required' }] };
-            return wrap(() => this.client.getDatabaseBackup(database_uuid, backup_uuid));
-          case 'list_executions':
-            if (!backup_uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: backup_uuid required' }] };
-            return wrap(() => this.client.listBackupExecutions(database_uuid, backup_uuid));
-          case 'get_execution':
-            if (!backup_uuid || !execution_uuid)
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Error: backup_uuid, execution_uuid required' },
-                ],
-              };
-            return wrap(() =>
-              this.client.getBackupExecution(database_uuid, backup_uuid, execution_uuid),
-            );
-          case 'create':
-            if (!args.frequency)
-              return { content: [{ type: 'text' as const, text: 'Error: frequency required' }] };
-            return wrap(() =>
-              this.client.createDatabaseBackup(database_uuid, {
-                ...backupData,
-                frequency: args.frequency!,
-              }),
-            );
-          case 'update':
-            if (!backup_uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: backup_uuid required' }] };
-            return wrap(() =>
-              this.client.updateDatabaseBackup(database_uuid, backup_uuid, backupData),
-            );
-          case 'delete':
-            if (!backup_uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: backup_uuid required' }] };
-            return wrap(() => this.client.deleteDatabaseBackup(database_uuid, backup_uuid));
-          case 'delete_execution':
-            if (!backup_uuid || !execution_uuid)
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Error: backup_uuid, execution_uuid required' },
-                ],
-              };
-            return wrap(() =>
-              this.client.deleteBackupExecution(database_uuid, backup_uuid, execution_uuid),
-            );
-        }
-      },
-    );
-
-    // =========================================================================
-    // Teams (1 tool - consolidated)
-    // =========================================================================
-    this.tool(
-      'teams',
-      'Manage teams: list/get/get_members/get_current/get_current_members',
-      {
-        action: z.enum(['list', 'get', 'get_members', 'get_current', 'get_current_members']),
-        id: z.number().optional(),
-      },
-      async ({ action, id }) => {
-        switch (action) {
-          case 'list':
-            return wrap(() => this.client.listTeams());
-          case 'get':
-            if (!id) return { content: [{ type: 'text' as const, text: 'Error: id required' }] };
-            return wrap(() => this.client.getTeam(id));
-          case 'get_members':
-            if (!id) return { content: [{ type: 'text' as const, text: 'Error: id required' }] };
-            return wrap(() => this.client.getTeamMembers(id));
-          case 'get_current':
-            return wrap(() => this.client.getCurrentTeam());
-          case 'get_current_members':
-            return wrap(() => this.client.getCurrentTeamMembers());
-        }
-      },
-    );
-
-    // =========================================================================
-    // Cloud Tokens (1 tool - consolidated)
-    // =========================================================================
-    this.tool(
-      'cloud_tokens',
-      'Manage cloud provider tokens (Hetzner/DigitalOcean): list/get/create/update/delete/validate',
-      {
-        action: z.enum(['list', 'get', 'create', 'update', 'delete', 'validate']),
-        uuid: z.string().optional(),
-        provider: z.enum(['hetzner', 'digitalocean']).optional(),
-        token: z.string().optional(),
-        name: z.string().optional(),
-      },
-      async ({ action, uuid, provider, token, name }) => {
-        switch (action) {
-          case 'list':
-            return wrap(() => this.client.listCloudTokens());
-          case 'get':
-            if (!uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() => this.client.getCloudToken(uuid));
-          case 'create':
-            if (!provider || !token || !name)
-              return {
-                content: [{ type: 'text' as const, text: 'Error: provider, token, name required' }],
-              };
-            return wrap(() => this.client.createCloudToken({ provider, token, name }));
-          case 'update':
-            if (!uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() => this.client.updateCloudToken(uuid, { name }));
-          case 'delete':
-            if (!uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() => this.client.deleteCloudToken(uuid));
-          case 'validate':
-            if (!uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            return wrap(() => this.client.validateCloudToken(uuid));
-        }
-      },
-    );
-
-    // =========================================================================
-    // Storages (1 tool - consolidated for app/db/service)
-    // =========================================================================
-    this.tool(
-      'storages',
-      'Manage persistent/file storages for app, database, or service: list/create/update/delete',
-      {
-        resource: z.enum(['application', 'database', 'service']),
-        action: z.enum(['list', 'create', 'update', 'delete']),
-        uuid: z.string(),
-        storage_uuid: z.string().optional(),
-        type: z.enum(['persistent', 'file']).optional(),
-        mount_path: z.string().optional(),
-        name: z.string().optional(),
-        host_path: z.string().optional(),
-        content: z.string().optional(),
-        is_directory: z.boolean().optional(),
-        fs_path: z.string().optional(),
-        is_preview_suffix_enabled: z.boolean().optional(),
-      },
-      async (args) => {
-        const { resource, action, uuid, storage_uuid } = args;
-        if (action === 'create' && (!args.type || !args.mount_path))
-          return { content: [{ type: 'text' as const, text: 'Error: type, mount_path required' }] };
-        if (action === 'update' && (!args.type || !storage_uuid))
-          return {
-            content: [{ type: 'text' as const, text: 'Error: type, storage_uuid required' }],
-          };
-        if (action === 'delete' && !storage_uuid)
-          return { content: [{ type: 'text' as const, text: 'Error: storage_uuid required' }] };
-        const methods: Record<string, Record<string, () => Promise<unknown>>> = {
-          application: {
-            list: () => this.client.listApplicationStorages(uuid),
-            create: () =>
-              this.client.createApplicationStorage(uuid, {
-                type: args.type!,
-                mount_path: args.mount_path!,
-                name: args.name,
-                host_path: args.host_path,
-                content: args.content,
-                is_directory: args.is_directory,
-                fs_path: args.fs_path,
-                is_preview_suffix_enabled: args.is_preview_suffix_enabled,
-              }),
-            update: () =>
-              this.client.updateApplicationStorage(uuid, {
-                uuid: storage_uuid!,
-                type: args.type!,
-                mount_path: args.mount_path,
-                name: args.name,
-                host_path: args.host_path,
-                content: args.content,
-                is_directory: args.is_directory,
-                is_preview_suffix_enabled: args.is_preview_suffix_enabled,
-              }),
-            delete: () => this.client.deleteApplicationStorage(uuid, storage_uuid!),
-          },
-          database: {
-            list: () => this.client.listDatabaseStorages(uuid),
-            create: () =>
-              this.client.createDatabaseStorage(uuid, {
-                type: args.type!,
-                mount_path: args.mount_path!,
-                name: args.name,
-                host_path: args.host_path,
-                content: args.content,
-                is_directory: args.is_directory,
-                fs_path: args.fs_path,
-                is_preview_suffix_enabled: args.is_preview_suffix_enabled,
-              }),
-            update: () =>
-              this.client.updateDatabaseStorage(uuid, {
-                uuid: storage_uuid!,
-                type: args.type!,
-                mount_path: args.mount_path,
-                name: args.name,
-                host_path: args.host_path,
-                content: args.content,
-                is_directory: args.is_directory,
-                is_preview_suffix_enabled: args.is_preview_suffix_enabled,
-              }),
-            delete: () => this.client.deleteDatabaseStorage(uuid, storage_uuid!),
-          },
-          service: {
-            list: () => this.client.listServiceStorages(uuid),
-            create: () =>
-              this.client.createServiceStorage(uuid, {
-                type: args.type!,
-                mount_path: args.mount_path!,
-                name: args.name,
-                host_path: args.host_path,
-                content: args.content,
-                is_directory: args.is_directory,
-                fs_path: args.fs_path,
-                is_preview_suffix_enabled: args.is_preview_suffix_enabled,
-              }),
-            update: () =>
-              this.client.updateServiceStorage(uuid, {
-                uuid: storage_uuid!,
-                type: args.type!,
-                mount_path: args.mount_path,
-                name: args.name,
-                host_path: args.host_path,
-                content: args.content,
-                is_directory: args.is_directory,
-                is_preview_suffix_enabled: args.is_preview_suffix_enabled,
-              }),
-            delete: () => this.client.deleteServiceStorage(uuid, storage_uuid!),
-          },
-        };
-        return wrap(() => methods[resource][action]());
-      },
-    );
-
-    // =========================================================================
-    // Scheduled Tasks (1 tool - consolidated for app/service)
-    // =========================================================================
-    this.tool(
-      'scheduled_tasks',
-      'Manage scheduled tasks for app or service: list/create/update/delete/list_executions',
-      {
-        resource: z.enum(['application', 'service']),
-        action: z.enum(['list', 'create', 'update', 'delete', 'list_executions']),
-        uuid: z.string(),
-        task_uuid: z.string().optional(),
-        name: z.string().optional(),
-        command: z.string().optional(),
-        frequency: z.string().optional(),
-        container: z.string().optional(),
-        timeout: z.number().optional(),
-        enabled: z.boolean().optional(),
-      },
-      async (args) => {
-        const { resource, action, uuid, task_uuid } = args;
-        const isApp = resource === 'application';
-        switch (action) {
-          case 'list':
-            return wrap(() =>
-              isApp
-                ? this.client.listApplicationScheduledTasks(uuid)
-                : this.client.listServiceScheduledTasks(uuid),
-            );
-          case 'create':
-            if (!args.name || !args.command || !args.frequency)
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Error: name, command, frequency required' },
-                ],
-              };
-            return wrap(() => {
-              const data = {
-                name: args.name!,
-                command: args.command!,
-                frequency: args.frequency!,
-                container: args.container,
-                timeout: args.timeout,
-                enabled: args.enabled,
-              };
-              return isApp
-                ? this.client.createApplicationScheduledTask(uuid, data)
-                : this.client.createServiceScheduledTask(uuid, data);
-            });
-          case 'update':
-            if (!task_uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: task_uuid required' }] };
-            return wrap(() => {
-              const data = {
-                name: args.name,
-                command: args.command,
-                frequency: args.frequency,
-                container: args.container,
-                timeout: args.timeout,
-                enabled: args.enabled,
-              };
-              return isApp
-                ? this.client.updateApplicationScheduledTask(uuid, task_uuid, data)
-                : this.client.updateServiceScheduledTask(uuid, task_uuid, data);
-            });
-          case 'delete':
-            if (!task_uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: task_uuid required' }] };
-            return wrap(() =>
-              isApp
-                ? this.client.deleteApplicationScheduledTask(uuid, task_uuid)
-                : this.client.deleteServiceScheduledTask(uuid, task_uuid),
-            );
-          case 'list_executions':
-            if (!task_uuid)
-              return { content: [{ type: 'text' as const, text: 'Error: task_uuid required' }] };
-            return wrap(() =>
-              isApp
-                ? this.client.listApplicationScheduledTaskExecutions(uuid, task_uuid)
-                : this.client.listServiceScheduledTaskExecutions(uuid, task_uuid),
-            );
-        }
-      },
-    );
-
-    // =========================================================================
-    // Hetzner Cloud (1 tool - consolidated)
-    // =========================================================================
-    this.tool(
-      'hetzner',
-      'Hetzner cloud: list_locations/list_server_types/list_images/list_ssh_keys/create_server',
-      {
-        action: z.enum([
-          'list_locations',
-          'list_server_types',
-          'list_images',
-          'list_ssh_keys',
-          'create_server',
-        ]),
-        cloud_provider_token_uuid: z.string().optional(),
-        location: z.string().optional(),
-        server_type: z.string().optional(),
-        image: z.number().optional(),
-        name: z.string().optional(),
-        private_key_uuid: z.string().optional(),
-        enable_ipv4: z.boolean().optional(),
-        enable_ipv6: z.boolean().optional(),
-        hetzner_ssh_key_ids: z.array(z.number()).optional(),
-        cloud_init_script: z.string().optional(),
-        instant_validate: z.boolean().optional(),
-      },
-      async (args) => {
-        const { action, cloud_provider_token_uuid: tokenUuid } = args;
-        switch (action) {
-          case 'list_locations':
-            if (!tokenUuid)
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Error: cloud_provider_token_uuid required' },
-                ],
-              };
-            return wrap(() => this.client.listHetznerLocations(tokenUuid));
-          case 'list_server_types':
-            if (!tokenUuid)
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Error: cloud_provider_token_uuid required' },
-                ],
-              };
-            return wrap(() => this.client.listHetznerServerTypes(tokenUuid));
-          case 'list_images':
-            if (!tokenUuid)
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Error: cloud_provider_token_uuid required' },
-                ],
-              };
-            return wrap(() => this.client.listHetznerImages(tokenUuid));
-          case 'list_ssh_keys':
-            if (!tokenUuid)
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Error: cloud_provider_token_uuid required' },
-                ],
-              };
-            return wrap(() => this.client.listHetznerSSHKeys(tokenUuid));
-          case 'create_server':
-            if (!args.location || !args.server_type || !args.image || !args.private_key_uuid)
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: 'Error: location, server_type, image, private_key_uuid required',
-                  },
-                ],
-              };
-            return wrap(() =>
-              this.client.createHetznerServer({
-                cloud_provider_token_uuid: tokenUuid,
-                location: args.location!,
-                server_type: args.server_type!,
-                image: args.image!,
-                name: args.name,
-                private_key_uuid: args.private_key_uuid!,
-                enable_ipv4: args.enable_ipv4,
-                enable_ipv6: args.enable_ipv6,
-                hetzner_ssh_key_ids: args.hetzner_ssh_key_ids,
-                cloud_init_script: args.cloud_init_script,
-                instant_validate: args.instant_validate,
-              }),
-            );
-        }
-      },
-    );
-
-    // =========================================================================
-    // System (1 tool - health/list_resources/api_control consolidated)
-    // =========================================================================
-    this.tool(
-      'system',
-      'System operations: health/list_resources/enable_api/disable_api. `list_resources` defaults to an essential projection (uuid/name/type/status) to keep token budgets sane on instances with many resources; pass `include_full: true` for the raw Coolify payload. When `include_full: true`, webhook HMAC secrets and basic-auth password are masked unless `reveal: true` is also set (matches the `env_vars` `reveal` ergonomics).',
-      {
-        action: z.enum(['health', 'list_resources', 'enable_api', 'disable_api']),
-        include_full: z.boolean().optional(),
-        reveal: z.boolean().optional(),
-      },
-      async ({ action, include_full, reveal }) => {
-        switch (action) {
-          case 'health':
-            return wrap(() => this.client.getHealth());
-          case 'list_resources':
-            return wrap(() => this.client.listResources({ include_full, reveal }));
-          case 'enable_api':
-            return wrap(() => this.client.enableApi());
-          case 'disable_api':
-            return wrap(() => this.client.disableApi());
-        }
-      },
-    );
-
-    // =========================================================================
-    // Documentation Search (1 tool)
-    // =========================================================================
-    this.tool(
-      'search_docs',
-      'Search Coolify documentation for how-to guides, configuration, troubleshooting',
-      {
-        query: z.string().describe('Search query'),
-        limit: z.number().optional().describe('Max results (default 5)'),
-      },
-      async ({ query, limit }) =>
-        wrap(async () => {
-          const results = await this.docsSearch.search(query, limit ?? 5);
-          if (results.length === 0) {
-            return { results: [], hint: 'No matches. Try broader or different keywords.' };
-          }
-          return { results };
-        }),
-    );
-
-    // =========================================================================
-    // Batch Operations (4 tools)
-    // =========================================================================
-    this.tool(
-      'restart_project_apps',
-      'Restart all apps in project',
-      { project_uuid: z.string() },
-      async ({ project_uuid }) => wrap(() => this.client.restartProjectApps(project_uuid)),
-    );
-
-    this.tool(
-      'bulk_env_update',
-      'Update env var across multiple apps',
-      {
-        app_uuids: z.array(z.string()),
-        key: z.string(),
-        value: z.string(),
-        is_buildtime: z.boolean().optional(),
-        is_runtime: z.boolean().optional(),
-      },
-      async ({ app_uuids, key, value, is_buildtime, is_runtime }) =>
-        wrap(() => this.client.bulkEnvUpdate(app_uuids, key, value, is_buildtime, is_runtime)),
-    );
-
-    this.tool(
-      'stop_all_apps',
-      'EMERGENCY: Stop all running apps',
-      { confirm: z.literal(true) },
-      async ({ confirm }) => {
-        if (!confirm)
-          return { content: [{ type: 'text' as const, text: 'Error: confirm=true required' }] };
-        return wrap(() => this.client.stopAllApps());
-      },
-    );
-
-    this.tool(
-      'redeploy_project',
-      'Redeploy all apps in project',
-      { project_uuid: z.string(), force: z.boolean().optional() },
-      async ({ project_uuid, force }) =>
-        wrap(() => this.client.redeployProjectApps(project_uuid, force ?? true)),
-    );
-  }
-}
+         
