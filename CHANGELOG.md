@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Environment diagnostics distinguish production from preview rows** — `inspect_env` now reports production and preview entries, duplicate counts, effective rows, flag conflicts, and value conflicts separately instead of treating a normal preview twin as a production duplicate. `reconcile_env` now scopes deduplication to production rows and verifies preview rows remain untouched.
 - **`create_application` accepts `destination_uuid`** — validates an optional bounded Coolify destination identifier, includes it in previews when supplied, and forwards it to application creation without inferring a destination or changing the default preview-only behavior.
 
 ### Documentation
