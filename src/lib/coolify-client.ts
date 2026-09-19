@@ -1305,20 +1305,20 @@ export class CoolifyClient {
 
   async startService(uuid: string): Promise<MessageResponse> {
     return this.request<MessageResponse>(`/services/${uuid}/start`, {
-      method: 'GET',
+      method: 'POST',
     });
   }
 
   async stopService(uuid: string): Promise<MessageResponse> {
     return this.request<MessageResponse>(`/services/${uuid}/stop`, {
-      method: 'GET',
+      method: 'POST',
     });
   }
 
   async restartService(uuid: string, pullLatest = false): Promise<MessageResponse> {
     const qs = pullLatest ? '?latest=true' : '';
     return this.request<MessageResponse>(`/services/${uuid}/restart${qs}`, {
-      method: 'GET',
+      method: 'POST',
     });
   }
 
@@ -1426,9 +1426,11 @@ export class CoolifyClient {
   ): Promise<DeployTriggerResponse> {
     // Detect if the value looks like a UUID or a tag name
     const param = this.isLikelyUuid(tagOrUuid) ? 'uuid' : 'tag';
+    // Coolify >= 4.3 returns 400 "This endpoint has changed to a POST request."
+    // for GET /deploy; the deploy trigger is a POST-only mutation.
     return this.request<DeployTriggerResponse>(
       `/deploy?${param}=${encodeURIComponent(tagOrUuid)}&force=${force}`,
-      { method: 'GET' },
+      { method: 'POST' },
     );
   }
 

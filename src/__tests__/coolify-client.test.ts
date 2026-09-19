@@ -550,7 +550,7 @@ describe('CoolifyClient', () => {
       expect(result).toEqual({ message: 'Deployed' });
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/deploy?tag=my-tag&force=true',
-        expect.any(Object),
+        expect.objectContaining({ method: 'POST' }),
       );
     });
 
@@ -562,7 +562,7 @@ describe('CoolifyClient', () => {
 
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/deploy?uuid=xs0sgs4gog044s4k4c88kgsc&force=false',
-        expect.any(Object),
+        expect.objectContaining({ method: 'POST' }),
       );
     });
 
@@ -574,7 +574,22 @@ describe('CoolifyClient', () => {
 
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/deploy?uuid=a1b2c3d4-e5f6-7890-abcd-ef1234567890&force=true',
-        expect.any(Object),
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+
+    it('should never issue the legacy GET /deploy that Coolify rejects', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse({ message: 'Deployed' }));
+
+      await client.deployByTagOrUuid('xs0sgs4gog044s4k4c88kgsc');
+
+      const methods = mockFetch.mock.calls.map(
+        ([, init]) => (init as RequestInit | undefined)?.method,
+      );
+      expect(methods).not.toContain('GET');
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/v1/deploy?uuid='),
+        expect.objectContaining({ method: 'POST' }),
       );
     });
   });
@@ -2438,7 +2453,7 @@ describe('CoolifyClient', () => {
       expect(result).toEqual({ message: 'Started' });
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/services/test-uuid/start',
-        expect.objectContaining({ method: 'GET' }),
+        expect.objectContaining({ method: 'POST' }),
       );
     });
 
@@ -2450,7 +2465,7 @@ describe('CoolifyClient', () => {
       expect(result).toEqual({ message: 'Stopped' });
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/services/test-uuid/stop',
-        expect.objectContaining({ method: 'GET' }),
+        expect.objectContaining({ method: 'POST' }),
       );
     });
 
@@ -2462,8 +2477,16 @@ describe('CoolifyClient', () => {
       expect(result).toEqual({ message: 'Restarted' });
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/services/test-uuid/restart',
-        expect.objectContaining({ method: 'GET' }),
+        expect.objectContaining({ method: 'POST' }),
       );
+    });
+
+    it('should surface the POST-required drift error with the upstream message', async () => {
+      mockFetch.mockResolvedValueOnce(
+        mockResponse({ message: 'This endpoint has changed to a POST request.' }, false, 400),
+      );
+
+      await expect(client.startService('test-uuid')).rejects.toThrow(/POST request/);
     });
   });
 
@@ -2985,7 +3008,7 @@ describe('CoolifyClient', () => {
 
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/deploy?tag=my-tag&force=false',
-        expect.any(Object),
+        expect.objectContaining({ method: 'POST' }),
       );
     });
   });
