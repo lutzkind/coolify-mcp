@@ -3059,9 +3059,14 @@ export class CoolifyMcpServer extends McpServer {
       warnings,
       audit_id: crypto.randomUUID(),
     });
+    const isPreviewEnvEntry = (entry: Record<string, unknown>) => entry.is_preview === true;
+    const envEntryValue = (entry: Record<string, unknown>): unknown =>
+      entry.real_value ?? entry.value ?? null;
     const safeEnvEntry = (entry: Record<string, unknown>) => ({
       entry_uuid: entry.uuid ?? null,
       key: entry.key ?? null,
+      is_preview: isPreviewEnvEntry(entry),
+      scope: isPreviewEnvEntry(entry) ? 'preview' : 'production',
       is_buildtime: entry.is_buildtime ?? null,
       is_runtime: entry.is_runtime ?? null,
       has_value: Boolean(entry.value || entry.real_value),
@@ -3069,7 +3074,7 @@ export class CoolifyMcpServer extends McpServer {
     });
     this.tool(
       'inspect_env',
-      'Inspect only an explicit bounded key list for one exact Coolify resource UUID. Values are always redacted; duplicate and effective-entry metadata is retained.',
+      'Inspect only an explicit bounded key list for one exact Coolify resource UUID. Values are always redacted; production and preview scopes, duplicate counts, effective entries, flags, and value-conflict metadata are reported separately.',
       {
         resource: z.enum(['application', 'service', 'database']),
         uuid: z.string(),
@@ -3089,18 +3094,45 @@ export class CoolifyMcpServer extends McpServer {
           }
           const entries = requestedKeys.map((key) => {
             const matches = byKey.get(key) ?? [];
-            const flagPairs = new Set(
-              matches.map((entry) => `${Boolean(entry.is_buildtime)}:${Boolean(entry.is_runtime)}`),
+            const productionMatches = matches.filter((entry) => !isPreviewEnvEntry(entry));
+            const previewMatches = matches.filter(isPreviewEnvEntry);
+            const productionFlagPairs = new Set(
+              productionMatches.map(
+                (entry) => `${Boolean(entry.is_buildtime)}:${Boolean(entry.is_runtime)}`,
+              ),
             );
+            const previewFlagPairs = new Set(
+              previewMatches.map(
+                (entry) => `${Boolean(entry.is_buildtime)}:${Boolean(entry.is_runtime)}`,
+              ),
+            );
+            const productionValues = new Set(productionMatches.map(envEntryValue));
+            const previewValues = new Set(previewMatches.map(envEntryValue));
+            const effectiveProduction = productionMatches[productionMatches.length - 1];
+            const effectivePreview = previewMatches[previewMatches.length - 1];
             return {
               key,
               entries: matches.map(safeEnvEntry),
-              duplicate_count: Math.max(0, matches.length - 1),
-              conflicting_flags: flagPairs.size > 1,
-              effective_entry_uuid: matches.length
-                ? (matches[matches.length - 1].uuid ?? null)
-                : null,
-              effective_value_redacted: true,
+              production_entries: productionMatches.map(safeEnvEntry),
+              preview_entries: previewMatches.map(safeEnvEntry),
+              duplicate_count: Math.max(0, productionMatches.length - 1),
+              production_duplicate_count: Math.max(0, productionMatches.length - 1),
+              preview_duplicate_count: Math.max(0, previewMatches.length - 1),
+              conflicting_flags: productionFlagPairs.size > 1,
+              production_conflicting_flags: productionFlagPairs.size > 1,
+              preview_conflicting_flags: previewFlagPairs.size > 1,
+              production_conflicting_values: productionValues.size > 1,
+              preview_conflicting_values: previewValues.size > 1,
+              production_preview_value_mismatch:
+                Boolean(effectiveProduction) &&
+                Boolean(effectivePreview) &&
+                envEntryValue(effectiveProduction) !== envEntryValue(effectivePreview),
+              expected_preview_twin:
+                productionMatches.length === 1 && previewMatches.length === 1,
+              effective_entry_uuid: effectiveProduction?.uuid ?? null,
+              effective_production_entry_uuid: effectiveProduction?.uuid ?? null,
+              effective_preview_entry_uuid: effectivePreview?.uuid ?? null,
+              effective_value_redacted: Boolean(effectiveProduction),
             };
           });
           return {
@@ -3115,7 +3147,7 @@ export class CoolifyMcpServer extends McpServer {
     );
     this.tool(
       'reconcile_env',
-      'Preview-first exact-key environment reconciliation. Only requested keys may be created, updated, or deduplicated; plaintext values are never returned.',
+      'Preview-first exact-key production environment reconciliation. Only requested production rows may be created, updated, or deduplicated; preview rows are preserved and plaintext values are never returned.',
       {
         resource: z.enum(['application', 'service', 'database']),
         uuid: z.string(),
@@ -3137,9 +3169,15 @@ export class CoolifyMcpServer extends McpServer {
               throw new Error(`TARGET_MISMATCH: desired value supplied for unrequested key ${key}`);
           const all = await listEnvEntries(resource, uuid);
           const byKey = new Map<string, Record<string, unknown>[]>();
-          for (const entry of all)
-            if (requestedKeys.includes(String(entry.key)))
-              byKey.set(String(entry.key), [...(byKey.get(String(entry.key)) ?? []), entry]);
+          const previewByKey = new Map<string, Record<string, unknown>[]>();
+          for (const entry of all) {
+            if (!requestedKeys.includes(String(entry.key))) continue;
+            const targetMap = isPreviewEnvEntry(entry) ? previewByKey : byKey;
+            targetMap.set(String(entry.key), [
+              ...(targetMap.get(String(entry.key)) ?? []),
+              entry,
+            ]);
+          }
           const retained: Record<string, unknown>[] = [],
             created: string[] = [],
             updated: string[] = [],
@@ -3150,7 +3188,7 @@ export class CoolifyMcpServer extends McpServer {
             const canonical = matches[matches.length - 1];
             if (!canonical) {
               if (desired[key] === undefined)
-                warnings.push(`no value supplied for missing key ${key}`);
+                warnings.push(`no value supplied for missing production key ${key}`);
               else created.push(key);
             } else {
               retained.push(safeEnvEntry(canonical));
@@ -3164,17 +3202,21 @@ export class CoolifyMcpServer extends McpServer {
                 if (duplicate.uuid) deleted.push(String(duplicate.uuid));
             }
           }
-          const target = { resource, uuid, keys: requestedKeys };
+          const preservedPreview = requestedKeys.flatMap((key) =>
+            (previewByKey.get(key) ?? []).map(safeEnvEntry),
+          );
+          const target = { resource, uuid, keys: requestedKeys, scope: 'production' };
           if (!apply)
             return {
               ok: true,
               ...envMutation(target, false, true, warnings),
               preview_only: true,
               retained,
+              preserved_preview: preservedPreview,
               created,
               updated,
               deleted,
-              note: 'No changes were made. Re-run with apply=true.',
+              note: 'No changes were made. Re-run with apply=true. Preview rows are preserved.',
             };
           const methods = {
             application: {
@@ -3183,10 +3225,11 @@ export class CoolifyMcpServer extends McpServer {
                   ? this.client.updateApplicationEnvVar(uuid, {
                       key,
                       value,
+                      is_preview: false,
                       is_buildtime: Boolean(entry.is_buildtime),
                       is_runtime: Boolean(entry.is_runtime),
                     })
-                  : this.client.createApplicationEnvVar(uuid, { key, value }),
+                  : this.client.createApplicationEnvVar(uuid, { key, value, is_preview: false }),
               delete: (entryUuid: string) => this.client.deleteApplicationEnvVar(uuid, entryUuid),
             },
             service: {
@@ -3195,10 +3238,11 @@ export class CoolifyMcpServer extends McpServer {
                   ? this.client.updateServiceEnvVar(uuid, {
                       key,
                       value,
+                      is_preview: false,
                       is_buildtime: Boolean(entry.is_buildtime),
                       is_runtime: Boolean(entry.is_runtime),
                     })
-                  : this.client.createServiceEnvVar(uuid, { key, value }),
+                  : this.client.createServiceEnvVar(uuid, { key, value, is_preview: false }),
               delete: (entryUuid: string) => this.client.deleteServiceEnvVar(uuid, entryUuid),
             },
             database: {
@@ -3207,10 +3251,11 @@ export class CoolifyMcpServer extends McpServer {
                   ? this.client.updateDatabaseEnvVar(uuid, {
                       key,
                       value,
+                      is_preview: false,
                       is_buildtime: Boolean(entry.is_buildtime),
                       is_runtime: Boolean(entry.is_runtime),
                     })
-                  : this.client.createDatabaseEnvVar(uuid, { key, value }),
+                  : this.client.createDatabaseEnvVar(uuid, { key, value, is_preview: false }),
               delete: (entryUuid: string) => this.client.deleteDatabaseEnvVar(uuid, entryUuid),
             },
           }[resource];
@@ -3222,8 +3267,11 @@ export class CoolifyMcpServer extends McpServer {
               if (duplicate.uuid) await methods.delete(String(duplicate.uuid));
           }
           const finalEntries = await listEnvEntries(resource, uuid);
-          const remaining = finalEntries.filter((entry) =>
-            requestedKeys.includes(String(entry.key)),
+          const remaining = finalEntries.filter(
+            (entry) => requestedKeys.includes(String(entry.key)) && !isPreviewEnvEntry(entry),
+          );
+          const finalPreview = finalEntries.filter(
+            (entry) => requestedKeys.includes(String(entry.key)) && isPreviewEnvEntry(entry),
           );
           const verificationMismatches: Array<Record<string, unknown>> = [];
           for (const key of requestedKeys) {
@@ -3231,7 +3279,7 @@ export class CoolifyMcpServer extends McpServer {
             if (matches.length !== 1) {
               verificationMismatches.push({
                 key,
-                reason: 'canonical_entry_count',
+                reason: 'production_canonical_entry_count',
                 actual: matches.length,
               });
               continue;
@@ -3243,6 +3291,21 @@ export class CoolifyMcpServer extends McpServer {
             ) {
               verificationMismatches.push({ key, reason: 'desired_value', actual: '[REDACTED]' });
             }
+            const beforePreviewUuids = (previewByKey.get(key) ?? [])
+              .map((entry) => String(entry.uuid ?? ''))
+              .sort();
+            const afterPreviewUuids = finalPreview
+              .filter((entry) => String(entry.key) === key)
+              .map((entry) => String(entry.uuid ?? ''))
+              .sort();
+            if (JSON.stringify(beforePreviewUuids) !== JSON.stringify(afterPreviewUuids)) {
+              verificationMismatches.push({
+                key,
+                reason: 'preview_scope_mutated',
+                before_count: beforePreviewUuids.length,
+                after_count: afterPreviewUuids.length,
+              });
+            }
           }
           if (verificationMismatches.length > 0)
             throw new Error(
@@ -3253,6 +3316,7 @@ export class CoolifyMcpServer extends McpServer {
             ...envMutation(target, true, true, warnings),
             preview_only: false,
             retained: remaining.map(safeEnvEntry),
+            preserved_preview: finalPreview.map(safeEnvEntry),
             created,
             updated,
             deleted,
