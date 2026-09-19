@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Environment diagnostics distinguish production from preview rows** — `inspect_env` now reports production and preview entries, duplicate counts, effective rows, flag conflicts, and value conflicts separately instead of treating a normal preview twin as a production duplicate. `reconcile_env` now scopes deduplication to production rows and verifies preview rows remain untouched.
+
 - **`create_application` accepts `destination_uuid`** — validates an optional bounded Coolify destination identifier, includes it in previews when supplied, and forwards it to application creation without inferring a destination or changing the default preview-only behavior.
 
 ### Documentation
@@ -59,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`deployment get` with `lines` no longer returns the raw upstream payload** (#232, #242) — requesting logs used to bypass the `toDeploymentEssential()` projection and return the full Coolify deployment object, embedding the application graph (rendered `docker_compose`, `custom_labels`, webhook secrets) and the destination server's settings including `logdrain_custom_config` (a live log-drain bearer token) and `sentinel_token` — ~78 KB for 5 log lines. `getDeployment()` and `listApplicationDeployments()` now always project through `toDeploymentEssential()` and attach only the log string when logs are requested; the raw upstream object never escapes the client. Regression tests assert no `logdrain` / `sentinel_token` / `manual_webhook_secret*` / `docker_compose` keys in the response and that a logs-included `get` stays under 20 KB against a bloated upstream payload.
+- **`deployment get` with `lines` no longer returns the raw upstream payload** (#232, #242) — requesting logs used to bypass the `toDeploymentEssential()` projection and return the full Coolify deployment object, embedding the application graph (rendered `docker_compose`, `custom_labels`, webhook secrets) and the destination server's settings including `logdrain_custom_config` (a live log-drain bearer [REDACTED] and `sentinel_token` — ~78 KB for 5 log lines. `getDeployment()` and `listApplicationDeployments()` now always project through `toDeploymentEssential()` and attach only the log string when logs are requested; the raw upstream object never escapes the client. Regression tests assert no `logdrain` / `sentinel_token` / `manual_webhook_secret*` / `docker_compose` keys in the response and that a logs-included `get` stays under 20 KB against a bloated upstream payload.
 
 ### Fixed
 
@@ -154,7 +156,7 @@ Net tool count: 38 → 42 (after consolidation; original PR proposed 45 before r
 
 ### Added
 
-- **`--header` CLI flag for custom HTTP headers** (#167, thanks @imantsk) — Inject extra headers (e.g. `--header "CF-Access-Client-Id: ..." --header "CF-Access-Client-Secret: ..."`) on every outbound request. Useful for Cloudflare Zero Trust, custom auth proxies, and other middleware sitting in front of Coolify. Multiple `--header` flags can be combined. Reserved headers (`Authorization`, `Content-Type`) are filtered with a warning to prevent silently overriding the Coolify bearer token.
+- **`--header` CLI flag for custom HTTP headers** (#167, thanks @imantsk) — Inject extra headers (e.g. `--header "CF-Access-Client-Id: ..." --header "CF-Access-Client-Secret: ***REDACTED***"`) on every outbound request. Useful for Cloudflare Zero Trust, custom auth proxies, and other middleware sitting in front of Coolify. Multiple `--header` flags can be combined. Reserved headers (`Authorization`, `Content-Type`) are filtered with a warning to prevent silently overriding the Coolify bearer [REDACTED]
 
 ## [2.8.0] - 2026-04-28
 
