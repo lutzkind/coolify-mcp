@@ -295,6 +295,11 @@ const PROVISION_POSTGRES_DEFAULT_VERSION = '16';
 const PROVISION_POSTGRES_DEFAULT_STORAGE_SIZE = '10Gi';
 const PROVISION_POSTGRES_READY_TIMEOUT_MS = 30_000;
 const PROVISION_POSTGRES_POLL_INTERVAL_MS = 1_000;
+// Intentional, exact-match coupling for the OSM lead-source sidecar, which
+// needs PostGIS at provisioning time. Both the database name and the
+// environment-variable key must match before the PostGIS image is selected;
+// all other provisioning stays on the official postgres image. See
+// docs/osm-sidecar-postgis.md before changing or widening this pairing.
 const OSM_SIDECAR_DATABASE_NAME = 'osm_lead_source';
 const OSM_SIDECAR_VARIABLE_KEY = 'OSM_LEAD_SOURCE_PRODUCTION_DATABASE_URL';
 const OSM_SIDECAR_POSTGIS_VERSION = '3.5';

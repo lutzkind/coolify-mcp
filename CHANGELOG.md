@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **OSM sidecar PostGIS coupling documented** — `docs/osm-sidecar-postgis.md` + a CLAUDE.md gotcha record why `provision_application_postgres` can return a PostGIS image, the exact-match guard on `(osm_lead_source, OSM_LEAD_SOURCE_PRODUCTION_DATABASE_URL)`, the tests that pin it, and the rule not to merge the superseded `fix/osm-postgis-provisioning` branch (PA-60).
 - **README rewritten, 462 → ~130 lines** — killed the duplicated Available Tools section (every tool was documented twice), the response-size table, workflow sermons, and mid-page plugs; depth now lives on [coolify-mcp.stumason.dev](https://coolify-mcp.stumason.dev). Removed the "98%+ test coverage" claim: jest computes coverage with `src/lib/mcp-server.ts` (the entire tool layer) excluded and enforces an 80% threshold, so the number was misleading. Remaining claims (42 tools, 85% token reduction, response-size reductions, smart lookup) were fact-checked against the codebase and CHANGELOG measurements.
 
 ## [2.14.0] - 2026-07-11
