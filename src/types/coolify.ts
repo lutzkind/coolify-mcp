@@ -187,12 +187,7 @@ export interface CreateEnvironmentRequest {
 // =============================================================================
 
 export type BuildPack =
-  | 'nixpacks'
-  | 'railpack'
-  | 'static'
-  | 'dockerfile'
-  | 'dockercompose'
-  | 'dockerimage';
+  'nixpacks' | 'railpack' | 'static' | 'dockerfile' | 'dockercompose' | 'dockerimage';
 
 export interface Application {
   id: number;
@@ -514,14 +509,7 @@ export interface EnvVarSummary {
 // =============================================================================
 
 export type DatabaseType =
-  | 'postgresql'
-  | 'mysql'
-  | 'mariadb'
-  | 'mongodb'
-  | 'redis'
-  | 'keydb'
-  | 'clickhouse'
-  | 'dragonfly';
+  'postgresql' | 'mysql' | 'mariadb' | 'mongodb' | 'redis' | 'keydb' | 'clickhouse' | 'dragonfly';
 
 export interface DatabaseLimits {
   memory?: string;
@@ -887,10 +875,14 @@ export interface DeployByTagRequest {
 }
 
 /**
- * Response from `GET /deploy?tag=|uuid=`. A tag can match multiple
- * applications, so Coolify returns one entry per triggered deployment.
- * `message` at the top level is kept for backwards compatibility with
- * older/mocked callers that only ever saw a bare `{ message }`.
+ * Response from `POST /deploy`. A tag can match multiple applications, so
+ * Coolify returns one entry per triggered deployment. `message` at the top
+ * level is kept for backwards compatibility with older/mocked callers that
+ * only ever saw a bare `{ message }`.
+ *
+ * The endpoint previously accepted `GET /deploy?tag=|uuid=`, which current
+ * Coolify releases reject with 405 "This endpoint has changed to a POST
+ * request."
  */
 export interface DeployTriggerResponse {
   message?: string;
