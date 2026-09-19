@@ -328,6 +328,50 @@ describe('environment scope diagnostics', () => {
     expect(entry.effective_preview_entry_uuid).toBe('preview-numeric');
   });
 
+  it('marks write-only secrets as withheld instead of reporting them as empty production rows', async () => {
+    const server = createServer();
+    jest.spyOn(server['client'], 'listApplicationEnvVars').mockResolvedValue([
+      {
+        uuid: 'prod-secret',
+        key: 'REQUESTED',
+        value: null,
+        real_value: null,
+        is_preview: false,
+        is_shown_once: true,
+        is_buildtime: false,
+        is_runtime: true,
+      },
+      {
+        uuid: 'preview-secret',
+        key: 'REQUESTED',
+        value: 'preview-secret-value',
+        is_preview: true,
+        is_shown_once: false,
+        is_buildtime: false,
+        is_runtime: true,
+      },
+    ] as never);
+
+    const result = await callTool(server, 'inspect_env', {
+      resource: 'application',
+      uuid: UUID,
+      keys: ['REQUESTED'],
+    });
+    const entry = jsonEntry(result);
+    const production = (entry.production_entries as Array<Record<string, unknown>>)[0];
+    const preview = (entry.preview_entries as Array<Record<string, unknown>>)[0];
+
+    expect(entry.production_duplicate_count).toBe(0);
+    expect(entry.expected_preview_twin).toBe(true);
+    expect(production).toEqual(
+      expect.objectContaining({ has_value: false, value_withheld: true, is_shown_once: true }),
+    );
+    expect(preview).toEqual(
+      expect.objectContaining({ has_value: true, value_withheld: false, is_shown_once: false }),
+    );
+    expect(result.content[0].text).not.toContain('preview-secret-value');
+  });
+
   it('keeps every inspected value redacted across multiple keys', async () => {
     const server = createServer();
     jest.spyOn(server['client'], 'listApplicationEnvVars').mockResolvedValue([
