@@ -2319,6 +2319,7 @@ export class CoolifyMcpServer extends McpServer {
         destination_uuid: z.string().optional(),
         git_repository: z.string().optional(),
         git_branch: z.string().optional(),
+        git_commit_sha: z.string().optional(),
         environment_name: z.string().optional(),
         environment_uuid: z.string().optional(),
         build_pack: z.string().optional(),

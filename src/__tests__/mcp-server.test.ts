@@ -750,6 +750,27 @@ describe('CoolifyMcpServer v2', () => {
         expect.objectContaining({ custom_network_aliases: 'edator-asr' }),
       );
     });
+
+    it('forwards an explicit git commit pin through update', async () => {
+      const spy = jest.spyOn(server['client'], 'updateApplication').mockResolvedValue({} as never);
+
+      await callApplication(server, {
+        action: 'update',
+        uuid: 'app-uuid',
+        git_repository: 'git@github.com:org/repo.git',
+        git_branch: 'main',
+        git_commit_sha: '6eca9ba7dbab1cdef4c2cdc6b764940bdf89d0da',
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        'app-uuid',
+        expect.objectContaining({
+          git_repository: 'git@github.com:org/repo.git',
+          git_branch: 'main',
+          git_commit_sha: '6eca9ba7dbab1cdef4c2cdc6b764940bdf89d0da',
+        }),
+      );
+    });
   });
 
   describe('create_application tool handler', () => {
