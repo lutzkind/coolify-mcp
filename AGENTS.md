@@ -16,12 +16,12 @@ GitHub: `lutzkind/coolify-mcp` (public fork) · Canonical checkout:
 
 ## Branch / state rule
 
-- Observed 2026-10-01: on `fix/coolify-post-endpoints-20260919`, 7 behind /
-  1 ahead of `main`, with unrelated in-progress edits
-  (`src/lib/mcp-server.ts` + new guardrail files). Do not touch those files,
-  do not switch branches, do not reset.
-- Production runs an image built from commit `603a6cb6`, which is **not on
-  main** (verified drift; Phase 2/3 decision).
+- Reconciled 2026-10-01: the guardrail work and the unmerged branch commits
+  (`fix/coolify-post-endpoints-20260919`, `codex/application-commit-update-schema-20260922`)
+  were landed on `main`; the canonical checkout is on `main`.
+- Local checkout is not proof of main/production. Check `git status -sb`.
+- Production was rebuilt from `main` on 2026-10-01 (dist verified
+  file-for-file against a fresh `main` build).
 
 ## Repository map
 
@@ -46,20 +46,34 @@ GitHub: `lutzkind/coolify-mcp` (public fork) · Canonical checkout:
 
 - `ci.yml` is the real gate: `npm ci`, security audit, prettier check, lint,
   spec drift, build, coverage tests.
+- This fork's GitHub Actions only execute via `workflow_dispatch`
+  (`gh workflow run ci.yml --repo lutzkind/coolify-mcp --ref main`); the
+  `push`/`pull_request` triggers do not fire. A green "no checks" state means
+  CI did not run, not that it passed.
 - Upstream workflows (publish, openapi-drift, claude) exist because this is a
   fork; treat their defaults as upstream-oriented.
 
 ## Production
 
 - Container `mcp-coolify` (image
-  `mcp-repair-health-mcp-coolify:20260922-git-commit-603a6cb6-r2`) plus bridge
-  `mcp-coolify-bridge`.
-- The deployed commit is not on `main` — surfaced drift; do not redeploy from
-  this checkout.
-- Live verification: a read-only Coolify API call through the MCP server; the
-  deployment state comes from the host image, not Git.
+  `mcp-repair-health-mcp-coolify:20261001-git-commit-3452bca0-r1`, built from
+  `main`) plus bridge `mcp-coolify-bridge` (bridge port 3117 → wrapper 3017).
+- Deploy mechanism (existing, reconstructed from image history): build context
+  with the v16 wrapper files (`/root/package.json`, `/root/package-lock.json`,
+  `/root/server.js`), the repo `package.json`/`package-lock.json`, and a fresh
+  `dist/` build; `Dockerfile`:
+  `FROM mcp-optimized:latest` → `npm ci` for the wrapper → `npm ci --omit=dev`
+  in `/app/coolify-mcp` → copy `server.js` and `dist/`; then run with
+  `--network o4080ws0og8w00ogs08co4cc`, `-p 3017:3000`,
+  `--env-file /root/mcp-coolify.env`, `COMMAND=node /app/coolify-mcp/dist/index.js`.
+  The container is image-frozen (no bind mount): a repo change needs a rebuild.
+- Live verification: `initialize` + `tools/call get_version` through
+  `http://127.0.0.1:3117/mcp` (a live Coolify API read), plus
+  `docker logs mcp-coolify` for the spawn/initialize lines.
+- Previous image `…:20260922-git-commit-603a6cb6-r2` and stopped container
+  `mcp-coolify-prev` are the rollback path.
 
-## Giant-file index (src/lib/mcp-server.ts, 4,506 lines)
+## Giant-file index (src/lib/mcp-server.ts, 4,681 lines)
 
 - ~45–160 version/validation helpers; ~159–300 create-application
   validation/payload
@@ -73,8 +87,9 @@ GitHub: `lutzkind/coolify-mcp` (public fork) · Canonical checkout:
   not duplicate its contents.
 - Upstream README/docs describe upstream behavior, not this fork's deployment
   policy.
-- `repomix-output.xml` and the `site/` lockfile are tracked generated
-  artifacts (Phase 2 candidate).
+- `repomix-output.xml` (generated bundle) was untracked and gitignored on
+  2026-10-01; regenerate with the external `repomix` tool if ever needed. The
+  `site/package-lock.json` is an intentional site lockfile.
 
 ## Do not read/search by default
 
