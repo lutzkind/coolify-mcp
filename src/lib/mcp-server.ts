@@ -1180,9 +1180,12 @@ export class CoolifyMcpServer extends McpServer {
     await super.connect(transport);
   }
 
-  private async identifyResource(uuid: string): Promise<{ kind: CoolifyResourceKind; resource: Record<string, unknown> }> {
+  private async identifyResource(
+    uuid: string,
+  ): Promise<{ kind: CoolifyResourceKind; resource: Record<string, unknown> }> {
     const requested = String(uuid || '').trim();
-    if (!isSafeCoolifyResourceId(requested)) throw new Error('RESOURCE_TYPE_INVALID: uuid must be an exact Coolify resource identifier');
+    if (!isSafeCoolifyResourceId(requested))
+      throw new Error('RESOURCE_TYPE_INVALID: uuid must be an exact Coolify resource identifier');
     const checks: Array<[CoolifyResourceKind, () => Promise<unknown>]> = [
       ['application', () => this.client.getApplication(requested)],
       ['service', () => this.client.getService(requested)],
@@ -1202,14 +1205,22 @@ export class CoolifyMcpServer extends McpServer {
       }
     }
     const kind = identifyResourceKind(requested, found);
-    if (!kind) throw new Error(`RESOURCE_TYPE_UNKNOWN: UUID ${requested} was not uniquely identified as an application, service, or database`);
+    if (!kind)
+      throw new Error(
+        `RESOURCE_TYPE_UNKNOWN: UUID ${requested} was not uniquely identified as an application, service, or database`,
+      );
     return { kind, resource: resources[kind]! };
   }
 
-  private async requireResourceKind(uuid: string, expected: CoolifyResourceKind): Promise<Record<string, unknown>> {
+  private async requireResourceKind(
+    uuid: string,
+    expected: CoolifyResourceKind,
+  ): Promise<Record<string, unknown>> {
     const identified = await this.identifyResource(uuid);
     if (identified.kind !== expected) {
-      throw new Error(`RESOURCE_TYPE_MISMATCH: UUID ${uuid} belongs to ${identified.kind}, but this operation requires ${expected}. Use the ${identified.kind}-specific lookup/action for this resource.`);
+      throw new Error(
+        `RESOURCE_TYPE_MISMATCH: UUID ${uuid} belongs to ${identified.kind}, but this operation requires ${expected}. Use the ${identified.kind}-specific lookup/action for this resource.`,
+      );
     }
     return identified.resource;
   }
@@ -2919,75 +2930,151 @@ export class CoolifyMcpServer extends McpServer {
       },
       async (args) =>
         wrap(async () => {
-          const compose = args.docker_compose_raw ?? (args.compose_directory
-            ? fs.readFileSync(resolveComposeFilePath(args.compose_directory, args.compose_file), 'utf8')
-            : null);
+          const compose =
+            args.docker_compose_raw ??
+            (args.compose_directory
+              ? fs.readFileSync(
+                  resolveComposeFilePath(args.compose_directory, args.compose_file),
+                  'utf8',
+                )
+              : null);
           if (!compose) throw new Error('docker_compose_raw or compose_directory is required');
           const preflight = composeDeploymentPreflight(compose);
-          const target = args.resource === 'application'
-            ? await this.getApplicationChecked(args.uuid)
-            : ((await this.client.getService(args.uuid)) as unknown as Record<string, unknown>);
-          const envEntries = args.resource === 'application'
-            ? await this.client.listApplicationEnvVars(args.uuid, { summary: false, reveal: false })
-            : await this.client.listServiceEnvVars(args.uuid);
-          const envDedup = deduplicateEnvironmentRecords((Array.isArray(envEntries) ? envEntries : []) as unknown as ComposeEnvironmentRecord[]);
+          const target =
+            args.resource === 'application'
+              ? await this.getApplicationChecked(args.uuid)
+              : ((await this.client.getService(args.uuid)) as unknown as Record<string, unknown>);
+          const envEntries =
+            args.resource === 'application'
+              ? await this.client.listApplicationEnvVars(args.uuid, {
+                  summary: false,
+                  reveal: false,
+                })
+              : await this.client.listServiceEnvVars(args.uuid);
+          const envDedup = deduplicateEnvironmentRecords(
+            (Array.isArray(envEntries) ? envEntries : []) as unknown as ComposeEnvironmentRecord[],
+          );
           const domain = String(args.expected_domain || '').trim();
-          const existingDomains = args.resource === 'application'
-            ? [target.fqdn, target.domains].filter(Boolean).flatMap((value) => String(value).split(','))
-            : (Array.isArray(target.domains) ? target.domains : []);
+          const existingDomains =
+            args.resource === 'application'
+              ? [target.fqdn, target.domains]
+                  .filter(Boolean)
+                  .flatMap((value) => String(value).split(','))
+              : Array.isArray(target.domains)
+                ? target.domains
+                : [];
           const preview = {
             resource: args.resource,
             uuid: args.uuid,
-            compose_file: args.compose_directory ? resolveComposeFilePath(args.compose_directory, args.compose_file) : null,
+            compose_file: args.compose_directory
+              ? resolveComposeFilePath(args.compose_directory, args.compose_file)
+              : null,
             preflight,
             environment: {
               duplicate_keys: envDedup.duplicate_keys,
               conflicting_keys: envDedup.conflicting_keys,
               blank_overrides_ignored: envDedup.blank_overrides_ignored,
             },
-            network: { required_networks: preflight.required_networks, ready: target.connect_to_docker_network !== false, reused: true, duplicate_created: false },
+            network: {
+              required_networks: preflight.required_networks,
+              ready: target.connect_to_docker_network !== false,
+              reused: true,
+              duplicate_created: false,
+            },
             expected_domain: domain || null,
             expected_internal_port: args.expected_internal_port ?? null,
             dry_run: args.dry_run || !args.apply,
             applied: false,
           };
           if (args.dry_run || !args.apply) return preview;
-          if (target.connect_to_docker_network === false) throw new Error('required Coolify/application Docker network is not enabled for the exact resource; refusing to start Compose');
-          if (envDedup.conflicting_keys.length > 0) throw new Error(`conflicting environment-variable records: ${envDedup.conflicting_keys.join(', ')}`);
-          if (domain && !existingDomains.some((item) => String(item).trim().includes(domain))) throw new Error(`expected domain is not routed by the exact ${args.resource}: ${domain}`);
-          if (args.expected_internal_port !== undefined && args.resource === 'application' && !String(target.ports_exposes || '').split(',').map((value) => Number(value.trim())).includes(args.expected_internal_port)) {
-            throw new Error(`expected internal service port is not configured on the exact application: ${args.expected_internal_port}`);
+          if (target.connect_to_docker_network === false)
+            throw new Error(
+              'required Coolify/application Docker network is not enabled for the exact resource; refusing to start Compose',
+            );
+          if (envDedup.conflicting_keys.length > 0)
+            throw new Error(
+              `conflicting environment-variable records: ${envDedup.conflicting_keys.join(', ')}`,
+            );
+          if (domain && !existingDomains.some((item) => String(item).trim().includes(domain)))
+            throw new Error(
+              `expected domain is not routed by the exact ${args.resource}: ${domain}`,
+            );
+          if (
+            args.expected_internal_port !== undefined &&
+            args.resource === 'application' &&
+            !String(target.ports_exposes || '')
+              .split(',')
+              .map((value) => Number(value.trim()))
+              .includes(args.expected_internal_port)
+          ) {
+            throw new Error(
+              `expected internal service port is not configured on the exact application: ${args.expected_internal_port}`,
+            );
           }
-          const deployment = args.resource === 'application'
-            ? await this.client.deployByTagOrUuid(args.uuid, false)
-            : await this.client.restartService(args.uuid);
-          const verifiedTarget = args.resource === 'application'
-            ? await this.getApplicationChecked(args.uuid)
-            : ((await this.client.getService(args.uuid)) as unknown as Record<string, unknown>);
+          const deployment =
+            args.resource === 'application'
+              ? await this.client.deployByTagOrUuid(args.uuid, false)
+              : await this.client.restartService(args.uuid);
+          const verifiedTarget =
+            args.resource === 'application'
+              ? await this.getApplicationChecked(args.uuid)
+              : ((await this.client.getService(args.uuid)) as unknown as Record<string, unknown>);
           const status = String(verifiedTarget.status || '').toLowerCase();
-          const publicRoute = domain ? await (async () => {
-            try {
-              const response = await fetch(domain.includes('://') ? domain : `https://${domain}`, { signal: AbortSignal.timeout(10000) });
-              return { checked: true, status: response.status, valid_response: response.status >= 200 && response.status < 400 };
-            } catch (error) {
-              return { checked: true, status: null, valid_response: false, error: String(error instanceof Error ? error.message : error) };
-            }
-          })() : { checked: false, status: null, valid_response: null };
-          const verifiedDomains = args.resource === 'application'
-            ? [verifiedTarget.fqdn, verifiedTarget.domains].filter(Boolean).flatMap((value) => String(value).split(','))
-            : (Array.isArray(verifiedTarget.domains) ? verifiedTarget.domains : []);
+          const publicRoute = domain
+            ? await (async () => {
+                try {
+                  const response = await fetch(
+                    domain.includes('://') ? domain : `https://${domain}`,
+                    { signal: AbortSignal.timeout(10000) },
+                  );
+                  return {
+                    checked: true,
+                    status: response.status,
+                    valid_response: response.status >= 200 && response.status < 400,
+                  };
+                } catch (error) {
+                  return {
+                    checked: true,
+                    status: null,
+                    valid_response: false,
+                    error: String(error instanceof Error ? error.message : error),
+                  };
+                }
+              })()
+            : { checked: false, status: null, valid_response: null };
+          const verifiedDomains =
+            args.resource === 'application'
+              ? [verifiedTarget.fqdn, verifiedTarget.domains]
+                  .filter(Boolean)
+                  .flatMap((value) => String(value).split(','))
+              : Array.isArray(verifiedTarget.domains)
+                ? verifiedTarget.domains
+                : [];
           return {
             ...preview,
             dry_run: false,
             applied: true,
             deployment_started: true,
-            deployment: { accepted: true, result: deployment && typeof deployment === 'object' ? { uuid: (deployment as Record<string, unknown>).uuid ?? null } : null },
+            deployment: {
+              accepted: true,
+              result:
+                deployment && typeof deployment === 'object'
+                  ? { uuid: (deployment as Record<string, unknown>).uuid ?? null }
+                  : null,
+            },
             verification: {
               expected_services: preflight.expected_services,
               services_running: status.includes('running') || status.includes('healthy'),
               health_status: status || 'unknown',
-              domain_routed: !domain || verifiedDomains.some((item) => String(item).trim().includes(domain)),
-              internal_port_configured: args.expected_internal_port === undefined || args.resource !== 'application' || String(verifiedTarget.ports_exposes || '').split(',').map((value) => Number(value.trim())).includes(args.expected_internal_port),
+              domain_routed:
+                !domain || verifiedDomains.some((item) => String(item).trim().includes(domain)),
+              internal_port_configured:
+                args.expected_internal_port === undefined ||
+                args.resource !== 'application' ||
+                String(verifiedTarget.ports_exposes || '')
+                  .split(',')
+                  .map((value) => Number(value.trim()))
+                  .includes(args.expected_internal_port),
               public_route: publicRoute,
             },
           };
@@ -3347,7 +3434,11 @@ export class CoolifyMcpServer extends McpServer {
             warnings: string[] = [];
           for (const key of requestedKeys) {
             const matches = byKey.get(key) ?? [];
-            const canonical = [...matches].reverse().find((entry) => String(entry.value ?? entry.real_value ?? '').length > 0) ?? matches.at(-1);
+            const canonical =
+              [...matches]
+                .reverse()
+                .find((entry) => String(entry.value ?? entry.real_value ?? '').length > 0) ??
+              matches.at(-1);
             if (
               desired[key] === '' &&
               canonical &&
@@ -4331,7 +4422,13 @@ export class CoolifyMcpServer extends McpServer {
         uuid: z.string(),
         task_uuid: z.string().optional(),
         name: z.string().optional(),
-        command: z.string().optional(),
+        command: z
+          .string()
+          .max(
+            255,
+            'Coolify rejects scheduled-task commands longer than 255 chars — split the command or bake a script into the container image',
+          )
+          .optional(),
         frequency: z.string().optional(),
         container: z.string().optional(),
         timeout: z.number().optional(),

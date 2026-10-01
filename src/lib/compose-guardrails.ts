@@ -26,12 +26,16 @@ export function resolveComposeFilePath(directory: string, requestedFile?: string
     if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) {
       throw new Error('compose file must remain inside the selected directory');
     }
-    if (!COMPOSE_FILE_NAMES.includes(path.basename(resolved) as (typeof COMPOSE_FILE_NAMES)[number])) {
+    if (
+      !COMPOSE_FILE_NAMES.includes(path.basename(resolved) as (typeof COMPOSE_FILE_NAMES)[number])
+    ) {
       throw new Error('compose file must be docker-compose.yml or docker-compose.yaml');
     }
     if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) return resolved;
   }
-  throw new Error('selected Docker Compose file does not exist (expected docker-compose.yml or docker-compose.yaml)');
+  throw new Error(
+    'selected Docker Compose file does not exist (expected docker-compose.yml or docker-compose.yaml)',
+  );
 }
 
 export function deduplicateEnvironmentRecords(records: ComposeEnvironmentRecord[]): {
@@ -46,25 +50,42 @@ export function deduplicateEnvironmentRecords(records: ComposeEnvironmentRecord[
     if (!key) continue;
     byKey.set(key, [...(byKey.get(key) ?? []), { ...record, key }]);
   }
-  const duplicateKeys = [...byKey.entries()].filter(([, values]) => values.length > 1).map(([key]) => key).sort();
+  const duplicateKeys = [...byKey.entries()]
+    .filter(([, values]) => values.length > 1)
+    .map(([key]) => key)
+    .sort();
   const conflictingKeys: string[] = [];
   const blankOverridesIgnored: string[] = [];
   const result: ComposeEnvironmentRecord[] = [];
   for (const key of [...byKey.keys()].sort()) {
     const values = byKey.get(key)!;
-    const populated = values.filter((item) => String(item.value ?? item.real_value ?? '').length > 0);
+    const populated = values.filter(
+      (item) => String(item.value ?? item.real_value ?? '').length > 0,
+    );
     const chosen = populated.at(-1) ?? values.at(-1)!;
     const distinct = new Set(populated.map((item) => String(item.value ?? item.real_value ?? '')));
     if (distinct.size > 1) conflictingKeys.push(key);
-    if (populated.length > 0 && values.at(-1) !== chosen && String(values.at(-1)?.value ?? values.at(-1)?.real_value ?? '') === '') {
+    if (
+      populated.length > 0 &&
+      values.at(-1) !== chosen &&
+      String(values.at(-1)?.value ?? values.at(-1)?.real_value ?? '') === ''
+    ) {
       blankOverridesIgnored.push(key);
     }
     result.push(chosen);
   }
-  return { records: result, duplicate_keys: duplicateKeys, conflicting_keys: conflictingKeys.sort(), blank_overrides_ignored: blankOverridesIgnored.sort() };
+  return {
+    records: result,
+    duplicate_keys: duplicateKeys,
+    conflicting_keys: conflictingKeys.sort(),
+    blank_overrides_ignored: blankOverridesIgnored.sort(),
+  };
 }
 
-export function identifyResourceKind(_uuid: string, found: Partial<Record<CoolifyResourceKind, boolean>>): CoolifyResourceKind | null {
+export function identifyResourceKind(
+  _uuid: string,
+  found: Partial<Record<CoolifyResourceKind, boolean>>,
+): CoolifyResourceKind | null {
   const kinds = (['application', 'service', 'database'] as const).filter((kind) => found[kind]);
   return kinds.length === 1 ? kinds[0] : null;
 }
@@ -75,7 +96,8 @@ export function composeDeploymentPreflight(compose: string): {
   environment_keys: string[];
 } {
   const document = parseDocument(compose);
-  if (document.errors.length) throw new Error(`Invalid Docker Compose YAML: ${document.errors[0].message}`);
+  if (document.errors.length)
+    throw new Error(`Invalid Docker Compose YAML: ${document.errors[0].message}`);
   const value = document.toJS() as Record<string, unknown>;
   const services = isRecord(value.services) ? Object.keys(value.services).sort() : [];
   if (services.length === 0) throw new Error('Docker Compose must define at least one service');
@@ -92,8 +114,13 @@ export function composeDeploymentPreflight(compose: string): {
         if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) environmentKeys.add(key);
       }
     } else if (isRecord(environment)) {
-      for (const key of Object.keys(environment)) if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) environmentKeys.add(key);
+      for (const key of Object.keys(environment))
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) environmentKeys.add(key);
     }
   }
-  return { expected_services: services, required_networks: networks, environment_keys: [...environmentKeys].sort() };
+  return {
+    expected_services: services,
+    required_networks: networks,
+    environment_keys: [...environmentKeys].sort(),
+  };
 }
