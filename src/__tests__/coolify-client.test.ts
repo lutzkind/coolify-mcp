@@ -587,6 +587,21 @@ describe('CoolifyClient', () => {
       );
     });
 
+    it('should never issue the legacy GET /deploy that Coolify rejects', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse({ message: 'Deployed' }));
+
+      await client.deployByTagOrUuid('xs0sgs4gog044s4k4c88kgsc');
+
+      const methods = mockFetch.mock.calls.map(
+        ([, init]) => (init as RequestInit | undefined)?.method,
+      );
+      expect(methods).not.toContain('GET');
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:3000/api/v1/deploy',
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+
     it('should never call /deploy with GET', async () => {
       mockFetch.mockResolvedValueOnce(mockResponse({ message: 'Deployed' }));
 
@@ -2457,7 +2472,7 @@ describe('CoolifyClient', () => {
       expect(result).toEqual({ message: 'Started' });
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/services/test-uuid/start',
-        expect.objectContaining({ method: 'GET' }),
+        expect.objectContaining({ method: 'POST' }),
       );
     });
 
@@ -2469,7 +2484,7 @@ describe('CoolifyClient', () => {
       expect(result).toEqual({ message: 'Stopped' });
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/services/test-uuid/stop',
-        expect.objectContaining({ method: 'GET' }),
+        expect.objectContaining({ method: 'POST' }),
       );
     });
 
@@ -2481,8 +2496,16 @@ describe('CoolifyClient', () => {
       expect(result).toEqual({ message: 'Restarted' });
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/services/test-uuid/restart',
-        expect.objectContaining({ method: 'GET' }),
+        expect.objectContaining({ method: 'POST' }),
       );
+    });
+
+    it('should surface the POST-required drift error with the upstream message', async () => {
+      mockFetch.mockResolvedValueOnce(
+        mockResponse({ message: 'This endpoint has changed to a POST request.' }, false, 400),
+      );
+
+      await expect(client.startService('test-uuid')).rejects.toThrow(/POST request/);
     });
   });
 
@@ -2650,14 +2673,34 @@ describe('CoolifyClient', () => {
       );
     });
 
-    it('should get a deployment with logs when includeLogs is true', async () => {
+    it('should attach logs to the essential projection when includeLogs is true', async () => {
       const deploymentWithLogs = { ...mockDeployment, logs: 'Build started...' };
       mockFetch.mockResolvedValueOnce(mockResponse(deploymentWithLogs));
 
       const result = await client.getDeployment('dep-uuid', { includeLogs: true });
 
-      // With includeLogs: true, returns full Deployment with logs
-      expect(result).toEqual(deploymentWithLogs);
+      // Still the essential projection — only the raw log string is attached.
+      // The upstream application/server graph and fields like `id`/`restart_only`
+      // must never leak.
+      expect(result).toEqual({
+        uuid: 'dep-uuid',
+        deployment_uuid: 'dep-123',
+        application_uuid: undefined,
+        application_name: 'test-app',
+        server_name: undefined,
+        status: 'finished',
+        commit: undefined,
+        force_rebuild: false,
+        is_webhook: false,
+        is_api: true,
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+        logs_available: true,
+        logs_info: 'Logs available (16 chars). Use lines param to retrieve.',
+        logs: 'Build started...',
+      });
+      expect(result).not.toHaveProperty('id');
+      expect(result).not.toHaveProperty('restart_only');
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/api/v1/deployments/dep-uuid',
         expect.any(Object),
@@ -2703,13 +2746,39 @@ describe('CoolifyClient', () => {
       );
     });
 
-    it('should return full deployments when includeLogs is true', async () => {
+    it('should attach raw logs to each essential deployment when includeLogs is true', async () => {
       const withLogs = { ...mockDeployment, logs: 'build log stream' };
       mockFetch.mockResolvedValueOnce(mockResponse({ count: 1, deployments: [withLogs] }));
 
       const result = await client.listApplicationDeployments('app-uuid', { includeLogs: true });
 
-      expect(result).toEqual({ count: 1, deployments: [withLogs] });
+      // The envelope keeps the essential projection (never the full upstream row):
+      // each entry adds the raw log string plus its availability breadcrumb.
+      expect(result).toEqual({
+        count: 1,
+        deployments: [
+          {
+            uuid: 'dep-uuid',
+            deployment_uuid: 'dep-123',
+            application_uuid: undefined,
+            application_name: 'test-app',
+            server_name: undefined,
+            status: 'finished',
+            commit: undefined,
+            force_rebuild: false,
+            is_webhook: false,
+            is_api: true,
+            created_at: '2024-01-01',
+            updated_at: '2024-01-01',
+            logs_available: true,
+            logs_info: 'Logs available (16 chars). Use lines param to retrieve.',
+            logs: 'build log stream',
+          },
+        ],
+      });
+      const [first] = result.deployments as Array<{ id?: unknown; restart_only?: unknown }>;
+      expect(first.id).toBeUndefined();
+      expect(first.restart_only).toBeUndefined();
     });
 
     it('should tolerate a malformed envelope (missing deployments array)', async () => {
@@ -4890,13 +4959,16 @@ describe('CoolifyClient', () => {
       expect('status' in result[0]).toBe(false);
     });
 
-    it('returns the raw Coolify payload when include_full is true', async () => {
+    it('masks custom_labels when include_full is true, never returning the raw value', async () => {
       mockFetch.mockResolvedValueOnce(mockResponse([fluffyResource]));
       const result = await client.listResources({ include_full: true });
-      expect(result).toEqual([fluffyResource]);
       const [first] = result as Array<Record<string, unknown>>;
       expect(first.config_hash).toBe(fluffyResource.config_hash);
-      expect(first.custom_labels).toBe(fluffyResource.custom_labels);
+      // custom_labels is in SENSITIVE_RESOURCE_FIELDS (Traefik basic-auth labels
+      // carry htpasswd hashes), so the raw value must never cross this boundary.
+      expect(first.custom_labels).toBe('***');
+      expect(first.custom_labels).not.toBe(fluffyResource.custom_labels);
+      expect(result).toEqual([{ ...fluffyResource, custom_labels: '***' }]);
     });
 
     it('treats include_full=false as the default essential projection', async () => {
@@ -4981,6 +5053,30 @@ describe('CoolifyClient', () => {
         mockFetch.mockResolvedValueOnce(mockResponse([sensitiveResource]));
         const result = await client.listResources({ reveal: true });
         expect(Object.keys(result[0]).sort()).toEqual(['name', 'status', 'type', 'uuid']);
+      });
+
+      it('masks nested environment_variables value and real_value on include_full=true', async () => {
+        const resourceWithEnv = {
+          ...fluffyResource,
+          environment_variables: [
+            { uuid: 'env-1', key: 'API_KEY', value: 'plain-secret', real_value: 'real-secret' },
+            { uuid: 'env-2', key: 'NO_VALUE', value: null },
+            null,
+            'raw-entry',
+          ],
+        };
+        mockFetch.mockResolvedValueOnce(mockResponse([resourceWithEnv]));
+
+        const [first] = (await client.listResources({ include_full: true })) as Array<
+          Record<string, unknown>
+        >;
+
+        expect(first.environment_variables).toEqual([
+          { uuid: 'env-1', key: 'API_KEY', value: '***', real_value: '***' },
+          { uuid: 'env-2', key: 'NO_VALUE', value: null },
+          null,
+          'raw-entry',
+        ]);
       });
     });
   });

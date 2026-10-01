@@ -113,6 +113,19 @@ describe('parseDocs', () => {
       expect(chunk.id).toBe(index);
     });
   });
+
+  it('should fall back to the url path when a page has no H1 and keep non-.md urls', () => {
+    const chunks = parseDocs(
+      '---\nurl: /docs/no-heading\ndescription: A page without an H1\n---\n\nBody text long enough to be a chunk.\n',
+    );
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].title).toBe('/docs/no-heading');
+    expect(chunks[0].url).toBe('https://coolify.io/docs/no-heading');
+  });
+
+  it('should skip pages whose body has no usable content', () => {
+    expect(parseDocs('---\nurl: /docs/empty\ndescription: Empty page\n---\n')).toEqual([]);
+  });
 });
 
 describe('DocsSearchEngine', () => {
@@ -220,6 +233,12 @@ describe('DocsSearchEngine', () => {
     } as Response);
 
     await expect(engine.search('test')).rejects.toThrow('Failed to fetch Coolify docs');
+  });
+
+  it('should throw when the index is unexpectedly missing after loading', async () => {
+    jest.spyOn(engine, 'ensureLoaded').mockResolvedValue(undefined);
+
+    await expect(engine.search('anything')).rejects.toThrow('Documentation index failed to load');
   });
 
   it('should retry after fetch failure', async () => {

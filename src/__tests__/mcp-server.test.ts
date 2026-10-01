@@ -675,40 +675,29 @@ describe('CoolifyMcpServer v2', () => {
       expect(forwarded).not.toHaveProperty('dockerfile_location');
     });
 
-    it('forwards fields in create_dockerfile', async () => {
-      const spy = jest
-        .spyOn(server['client'], 'createApplicationDockerfile')
-        .mockResolvedValue({ uuid: 'app-5' });
-
-      await callApplication(server, {
+    it('rejects the upstream-only create_dockerfile action at the schema boundary', () => {
+      // The fork rewrite dropped `create_dockerfile` from the `application` tool
+      // (action enum: create_public/create_github/create_key/create_dockerimage/
+      // update/deploy/delete/delete_preview). Dockerfile-backed creation lives in
+      // the separate `create_application` tool, whose execute path forwards
+      // build_pack/dockerfile_location/base_directory and is covered by
+      // "validates infrastructure, then sends the expected payload in execution mode".
+      const tool = (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            { inputSchema: { safeParse: (args: unknown) => { success: boolean } } }
+          >;
+        }
+      )._registeredTools['application'];
+      const result = tool.inputSchema.safeParse({
         action: 'create_dockerfile',
         project_uuid: 'proj-uuid',
         server_uuid: 'server-uuid',
         dockerfile: 'FROM node:20\nCMD ["node", "index.js"]',
         dockerfile_location: '/Dockerfile',
-        ports_exposes: '3000',
-        base_directory: '/apps/api',
       });
-
-      expect(spy).toHaveBeenCalledWith(
-        expect.objectContaining({
-          project_uuid: 'proj-uuid',
-          server_uuid: 'server-uuid',
-          dockerfile: 'FROM node:20\nCMD ["node", "index.js"]',
-          dockerfile_location: '/Dockerfile',
-          ports_exposes: '3000',
-          base_directory: '/apps/api',
-        }),
-      );
-    });
-
-    it('returns required-param error when create_dockerfile is missing dockerfile', async () => {
-      const result = (await callApplication(server, {
-        action: 'create_dockerfile',
-        project_uuid: 'proj-uuid',
-        server_uuid: 'server-uuid',
-      })) as { content: Array<{ text: string }> };
-      expect(result.content[0].text).toContain('project_uuid, server_uuid, dockerfile required');
+      expect(result.success).toBe(false);
     });
 
     it('forwards dockerfile_target_build through update (PATCH-only)', async () => {
@@ -748,6 +737,27 @@ describe('CoolifyMcpServer v2', () => {
       expect(spy).toHaveBeenCalledWith(
         'app-uuid',
         expect.objectContaining({ custom_network_aliases: 'edator-asr' }),
+      );
+    });
+
+    it('forwards an explicit git commit pin through update', async () => {
+      const spy = jest.spyOn(server['client'], 'updateApplication').mockResolvedValue({} as never);
+
+      await callApplication(server, {
+        action: 'update',
+        uuid: 'app-uuid',
+        git_repository: 'git@github.com:org/repo.git',
+        git_branch: 'main',
+        git_commit_sha: '6eca9ba7dbab1cdef4c2cdc6b764940bdf89d0da',
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        'app-uuid',
+        expect.objectContaining({
+          git_repository: 'git@github.com:org/repo.git',
+          git_branch: 'main',
+          git_commit_sha: '6eca9ba7dbab1cdef4c2cdc6b764940bdf89d0da',
+        }),
       );
     });
   });
@@ -2148,7 +2158,7 @@ describe('CoolifyMcpServer v2', () => {
 
       const parsed = JSON.parse(text) as { data: Record<string, unknown> };
       expect(parsed.data).toMatchObject({
-        uuid: 'dep-uuid',
+        deployment_uuid: 'dep-123',
         application_uuid: 'app-uuid',
         application_name: 'test-app',
         server_name: 'test-server',
@@ -2227,193 +2237,35 @@ describe('CoolifyMcpServer v2', () => {
     });
   });
 
-  describe('scheduled_tasks tool handler - run_once', () => {
-    type ServerWithSleep = { sleep: (ms: number) => Promise<void> };
-
-    const callScheduledTasks = async (
-      srv: CoolifyMcpServer,
-      args: Record<string, unknown>,
-    ): Promise<{ content: Array<{ type: string; text: string }> }> => {
+  describe('scheduled_tasks tool handler - run_once boundary', () => {
+    // Upstream-only feature dropped by the fork rewrite; not part of this
+    // deployment's tool surface (actions: list/create/update/delete/list_executions).
+    it('rejects action run_once at the schema boundary', () => {
       const tool = (
-        srv as unknown as {
+        server as unknown as {
           _registeredTools: Record<
             string,
-            { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+            { inputSchema: { safeParse: (args: unknown) => { success: boolean } } }
           >;
         }
       )._registeredTools['scheduled_tasks'];
-      return tool.handler(args, {}) as Promise<{ content: Array<{ type: string; text: string }> }>;
-    };
 
-    const baseArgs = {
-      resource: 'application' as const,
-      action: 'run_once' as const,
-      uuid: 'app-uuid',
-      command: 'php artisan migrate',
-      container: 'app',
-      wait_seconds: 10, // small budget -> few poll attempts in tests
-    };
-
-    const mockTask = {
-      id: 1,
-      uuid: 'task-uuid',
-      enabled: true,
-      name: 'oneoff-abc123',
-      command: 'php artisan migrate',
-      frequency: '* * * * *',
-      timeout: 0,
-      created_at: '',
-      updated_at: '',
-    };
-
-    beforeEach(() => {
-      // Poll loop uses a real setTimeout by default; override the instance method
-      // directly so tests are instant (jest.spyOn's generic inference struggles
-      // with private methods here, so a plain shadowing assignment is simpler).
-      (server as unknown as ServerWithSleep).sleep = (): Promise<void> => Promise.resolve();
-    });
-
-    it('validates command and container are required', async () => {
-      const result = await callScheduledTasks(server, {
+      const result = tool.inputSchema.safeParse({
         resource: 'application',
         action: 'run_once',
         uuid: 'app-uuid',
+        command: 'php artisan migrate',
+        container: 'app',
       });
-      expect(result.content[0]!.text).toBe('Error: command, container required');
-    });
 
-    it('creates a task, polls until a terminal execution, returns its output, and deletes the task', async () => {
-      const createSpy = jest
-        .spyOn(server['client'], 'createApplicationScheduledTask')
-        .mockResolvedValue(mockTask);
-      const listSpy = jest
-        .spyOn(server['client'], 'listApplicationScheduledTaskExecutions')
-        .mockResolvedValueOnce([]) // first poll: nothing yet
-        .mockResolvedValueOnce([
-          {
-            uuid: 'exec-uuid',
-            status: 'success',
-            message: 'Migrated: 2026_01_01_000000_add_col',
-            retry_count: 0,
-            created_at: '',
-            updated_at: '',
-          },
-        ]);
-      const deleteSpy = jest
-        .spyOn(server['client'], 'deleteApplicationScheduledTask')
-        .mockResolvedValue({ message: 'deleted' });
-
-      const result = await callScheduledTasks(server, baseArgs);
-
-      expect(createSpy).toHaveBeenCalledWith(
-        'app-uuid',
-        expect.objectContaining({
-          command: 'php artisan migrate',
-          frequency: '* * * * *',
-          container: 'app',
-          enabled: true,
-        }),
-      );
-      expect(listSpy).toHaveBeenCalledTimes(2);
-      expect(listSpy).toHaveBeenCalledWith('app-uuid', 'task-uuid');
-      expect(deleteSpy).toHaveBeenCalledWith('app-uuid', 'task-uuid');
-
-      const parsed = JSON.parse(result.content[0]!.text) as {
-        status: string;
-        message: string;
-        task_uuid: string;
-        cleanup: string;
-      };
-      expect(parsed.status).toBe('success');
-      expect(parsed.message).toBe('Migrated: 2026_01_01_000000_add_col');
-      expect(parsed.task_uuid).toBe('task-uuid');
-      expect(parsed.cleanup).toContain('deleted');
-    });
-
-    it('times out when no execution ever appears, and still deletes the task', async () => {
-      jest.spyOn(server['client'], 'createApplicationScheduledTask').mockResolvedValue(mockTask);
-      jest.spyOn(server['client'], 'listApplicationScheduledTaskExecutions').mockResolvedValue([]);
-      const deleteSpy = jest
-        .spyOn(server['client'], 'deleteApplicationScheduledTask')
-        .mockResolvedValue({ message: 'deleted' });
-
-      const result = await callScheduledTasks(server, baseArgs);
-
-      expect(deleteSpy).toHaveBeenCalledWith('app-uuid', 'task-uuid');
-      expect(result.content[0]!.text).toContain('Timed out');
-      expect(result.content[0]!.text).toContain('task-uuid');
-      expect(result.content[0]!.text).toContain('deleted');
-    });
-
-    it('still deletes the task when polling throws, and surfaces the poll error', async () => {
-      jest.spyOn(server['client'], 'createApplicationScheduledTask').mockResolvedValue(mockTask);
-      jest
-        .spyOn(server['client'], 'listApplicationScheduledTaskExecutions')
-        .mockRejectedValue(new Error('network blip'));
-      const deleteSpy = jest
-        .spyOn(server['client'], 'deleteApplicationScheduledTask')
-        .mockResolvedValue({ message: 'deleted' });
-
-      const result = await callScheduledTasks(server, baseArgs);
-
-      expect(deleteSpy).toHaveBeenCalledWith('app-uuid', 'task-uuid');
-      expect(result.content[0]!.text).toContain('network blip');
-      expect(result.content[0]!.text).toContain('task-uuid');
-    });
-
-    it('warns loudly with the task UUID when the cleanup delete itself fails', async () => {
-      jest.spyOn(server['client'], 'createApplicationScheduledTask').mockResolvedValue(mockTask);
-      jest.spyOn(server['client'], 'listApplicationScheduledTaskExecutions').mockResolvedValue([
-        {
-          uuid: 'exec-uuid',
-          status: 'success',
-          message: 'ok',
-          retry_count: 0,
-          created_at: '',
-          updated_at: '',
-        },
-      ]);
-      jest
-        .spyOn(server['client'], 'deleteApplicationScheduledTask')
-        .mockRejectedValue(new Error('403 forbidden'));
-
-      const result = await callScheduledTasks(server, baseArgs);
-
-      const parsed = JSON.parse(result.content[0]!.text) as { cleanup: string };
-      expect(parsed.cleanup).toContain('WARNING');
-      expect(parsed.cleanup).toContain('task-uuid');
-      expect(parsed.cleanup).toContain('403 forbidden');
-    });
-
-    it('supports the service resource', async () => {
-      const createSpy = jest
-        .spyOn(server['client'], 'createServiceScheduledTask')
-        .mockResolvedValue(mockTask);
-      jest.spyOn(server['client'], 'listServiceScheduledTaskExecutions').mockResolvedValue([
-        {
-          uuid: 'e',
-          status: 'success',
-          message: 'ok',
-          retry_count: 0,
-          created_at: '',
-          updated_at: '',
-        },
-      ]);
-      const deleteSpy = jest
-        .spyOn(server['client'], 'deleteServiceScheduledTask')
-        .mockResolvedValue({ message: 'deleted' });
-
-      await callScheduledTasks(server, { ...baseArgs, resource: 'service', uuid: 'svc-uuid' });
-
-      expect(createSpy).toHaveBeenCalledWith('svc-uuid', expect.any(Object));
-      expect(deleteSpy).toHaveBeenCalledWith('svc-uuid', 'task-uuid');
+      expect(result.success).toBe(false);
     });
   });
 
   describe('deploy tool handler', () => {
-    // #238 — opt-in `wait` polls the deployment to a terminal status instead
-    // of firing-and-forgetting. The no-wait path must stay byte-for-byte
-    // identical to the pre-#238 behaviour.
+    // The fork's deploy surface is { tag_or_uuid, force, dry_run }: upstream's
+    // opt-in `wait` polling (#238) was dropped by the fork rewrite and is not
+    // part of this deployment's tool surface.
 
     const callDeploy = async (
       srv: CoolifyMcpServer,
@@ -2429,27 +2281,6 @@ describe('CoolifyMcpServer v2', () => {
       )._registeredTools['deploy'];
       return tool.handler(args, {});
     };
-
-    const essentialDeployment = (
-      overrides: Partial<Record<string, unknown>> = {},
-    ): Record<string, unknown> => ({
-      uuid: 'dep-uuid',
-      deployment_uuid: 'dep-uuid',
-      application_uuid: 'app-uuid',
-      application_name: 'my-app',
-      status: 'in_progress',
-      commit: 'abc123',
-      force_rebuild: false,
-      is_webhook: false,
-      is_api: true,
-      created_at: '2026-01-01T10:00:00Z',
-      updated_at: '2026-01-01T10:00:00Z',
-      ...overrides,
-    });
-
-    afterEach(() => {
-      jest.useRealTimers();
-    });
 
     it('no-wait path is unchanged: triggers deploy and returns immediately', async () => {
       const spy = jest
@@ -2470,116 +2301,36 @@ describe('CoolifyMcpServer v2', () => {
       ]);
     });
 
-    it('wait: true polls until finished', async () => {
-      jest.useFakeTimers();
-      jest
-        .spyOn(server['client'], 'deployByTagOrUuid')
-        .mockResolvedValue({ deployments: [{ deployment_uuid: 'dep-uuid' }] });
-      const getDeploymentSpy = jest
-        .spyOn(server['client'], 'getDeployment')
-        .mockResolvedValueOnce(essentialDeployment({ status: 'in_progress' }) as never)
-        .mockResolvedValueOnce(essentialDeployment({ status: 'finished' }) as never);
+    it('does not expose the upstream-only wait/timeout options on the deploy schema', () => {
+      const tool = (
+        server as unknown as {
+          _registeredTools: Record<
+            string,
+            {
+              inputSchema: {
+                safeParse: (args: unknown) => { success: boolean; data?: Record<string, unknown> };
+                shape: Record<string, unknown>;
+              };
+            }
+          >;
+        }
+      )._registeredTools['deploy'];
 
-      const resultPromise = callDeploy(server, { tag_or_uuid: 'my-tag', wait: true }) as Promise<{
-        content: Array<{ text: string }>;
-      }>;
+      expect(Object.keys(tool.inputSchema.shape).sort()).toEqual([
+        'dry_run',
+        'force',
+        'tag_or_uuid',
+      ]);
 
-      await jest.advanceTimersByTimeAsync(5000);
-      const result = await resultPromise;
-
-      expect(getDeploymentSpy).toHaveBeenCalledTimes(2);
-      const parsed = JSON.parse(result.content[0].text);
-      expect(parsed.data.status).toBe('finished');
-      expect(parsed.data.deployment_uuid).toBe('dep-uuid');
-      expect(parsed.data.logs_tail).toBeUndefined();
-    });
-
-    it('wait: true returns a bounded log tail on failure, never the raw payload', async () => {
-      jest.useFakeTimers();
-      jest
-        .spyOn(server['client'], 'deployByTagOrUuid')
-        .mockResolvedValue({ deployments: [{ deployment_uuid: 'dep-uuid' }] });
-      jest
-        .spyOn(server['client'], 'getDeployment')
-        .mockImplementation(async (uuid: string, options?: { includeLogs?: boolean }) => {
-          if (options?.includeLogs) {
-            return {
-              ...essentialDeployment({ status: 'failed' }),
-              logs: JSON.stringify([{ output: 'build failed: OOM', timestamp: 't1' }]),
-              // Fields that would only appear on the raw upstream object —
-              // must never leak into the tool response.
-              server: { ip: '10.0.0.1', private_key: 'super-secret' },
-              application: { env_secret: 'shh' },
-            } as never;
-          }
-          return essentialDeployment({ status: 'failed' }) as never;
-        });
-
-      const resultPromise = callDeploy(server, { tag_or_uuid: 'my-tag', wait: true }) as Promise<{
-        content: Array<{ text: string }>;
-      }>;
-
-      const result = await resultPromise;
-      const parsed = JSON.parse(result.content[0].text);
-
-      expect(parsed.data.status).toBe('failed');
-      expect(parsed.data.deployment_uuid).toBe('dep-uuid');
-      expect(parsed.data.logs_tail).toContain('build failed: OOM');
-      expect(result.content[0].text).not.toContain('private_key');
-      expect(result.content[0].text).not.toContain('env_secret');
-      expect(parsed.data).not.toHaveProperty('server');
-      expect(parsed.data).not.toHaveProperty('application');
-    });
-
-    it('wait: true returns an explicit timeout with a next-action hint', async () => {
-      jest.useFakeTimers();
-      jest
-        .spyOn(server['client'], 'deployByTagOrUuid')
-        .mockResolvedValue({ deployments: [{ deployment_uuid: 'dep-uuid' }] });
-      jest
-        .spyOn(server['client'], 'getDeployment')
-        .mockResolvedValue(essentialDeployment({ status: 'in_progress' }) as never);
-
-      const resultPromise = callDeploy(server, {
+      // Unknown keys are stripped, not forwarded: `wait` must never reach the handler.
+      const result = tool.inputSchema.safeParse({
         tag_or_uuid: 'my-tag',
         wait: true,
         timeout_seconds: 10,
-      }) as Promise<{ content: Array<{ text: string }> }>;
-
-      // Let the poll loop exceed the 10s timeout.
-      await jest.advanceTimersByTimeAsync(15_000);
-      const result = await resultPromise;
-      const parsed = JSON.parse(result.content[0].text);
-
-      expect(parsed.data.status).toBe('in_progress');
-      expect(parsed.data.timed_out).toBe(true);
-      expect(parsed.data.deployment_uuid).toBe('dep-uuid');
-      expect(parsed.data.next_action).toEqual(expect.stringContaining('deployment'));
-    });
-
-    it('wait: true watches only the first deployment when a tag triggers several', async () => {
-      jest.useFakeTimers();
-      jest.spyOn(server['client'], 'deployByTagOrUuid').mockResolvedValue({
-        deployments: [{ deployment_uuid: 'dep-1' }, { deployment_uuid: 'dep-2' }],
       });
-      const getDeploymentSpy = jest.spyOn(server['client'], 'getDeployment').mockResolvedValue(
-        essentialDeployment({
-          status: 'finished',
-          deployment_uuid: 'dep-1',
-          uuid: 'dep-1',
-        }) as never,
-      );
-
-      const resultPromise = callDeploy(server, { tag_or_uuid: 'my-tag', wait: true }) as Promise<{
-        content: Array<{ text: string }>;
-      }>;
-      const result = await resultPromise;
-      const parsed = JSON.parse(result.content[0].text);
-
-      expect(getDeploymentSpy).toHaveBeenCalledWith('dep-1');
-      expect(getDeploymentSpy).not.toHaveBeenCalledWith('dep-2');
-      expect(parsed.data.deployment_uuid).toBe('dep-1');
-      expect(parsed.data.additional_deployment_uuids).toEqual(['dep-2']);
+      expect(result.success).toBe(true);
+      expect(result.data).not.toHaveProperty('wait');
+      expect(result.data).not.toHaveProperty('timeout_seconds');
     });
   });
 });
@@ -2746,41 +2497,35 @@ describe('getApplicationActions', () => {
     });
   });
 
-  it('should return restart/stop actions for running apps', () => {
+  it('should return logs + wait actions for running apps (no control actions in this fork surface)', () => {
     const actions = getApplicationActions('app-uuid', 'running');
-    expect(actions).toContainEqual({
-      tool: 'control',
-      args: { resource: 'application', action: 'restart', uuid: 'app-uuid' },
-      hint: 'Restart',
-    });
-    expect(actions).toContainEqual({
-      tool: 'control',
-      args: { resource: 'application', action: 'stop', uuid: 'app-uuid' },
-      hint: 'Stop',
-    });
+    expect(actions).toEqual([
+      { tool: 'application_logs', args: { uuid: 'app-uuid' }, hint: 'View logs' },
+      { tool: 'wait_for_application', args: { uuid: 'app-uuid' }, hint: 'Wait for ready status' },
+    ]);
   });
 
-  it('should return start action for stopped apps', () => {
+  it('should add the deployments action for stopped apps', () => {
     const actions = getApplicationActions('app-uuid', 'stopped');
     expect(actions).toContainEqual({
-      tool: 'control',
-      args: { resource: 'application', action: 'start', uuid: 'app-uuid' },
-      hint: 'Start',
+      tool: 'deployment',
+      args: { action: 'list_for_app', uuid: 'app-uuid' },
+      hint: 'Deployments',
     });
   });
 
-  it('should handle running:healthy status', () => {
+  it('should not add the deployments action for running:healthy status', () => {
     const actions = getApplicationActions('app-uuid', 'running:healthy');
-    expect(actions.some((a) => a.hint === 'Restart')).toBe(true);
-    expect(actions.some((a) => a.hint === 'Stop')).toBe(true);
+    expect(actions.some((a) => a.tool === 'deployment')).toBe(false);
+    expect(actions.map((a) => a.hint)).toEqual(['View logs', 'Wait for ready status']);
   });
 
-  it('should handle undefined status', () => {
+  it('should treat undefined status like a non-running app and offer deployments', () => {
     const actions = getApplicationActions('app-uuid', undefined);
     expect(actions).toContainEqual({
-      tool: 'control',
-      args: { resource: 'application', action: 'start', uuid: 'app-uuid' },
-      hint: 'Start',
+      tool: 'deployment',
+      args: { action: 'list_for_app', uuid: 'app-uuid' },
+      hint: 'Deployments',
     });
   });
 });

@@ -1305,20 +1305,20 @@ export class CoolifyClient {
 
   async startService(uuid: string): Promise<MessageResponse> {
     return this.request<MessageResponse>(`/services/${uuid}/start`, {
-      method: 'GET',
+      method: 'POST',
     });
   }
 
   async stopService(uuid: string): Promise<MessageResponse> {
     return this.request<MessageResponse>(`/services/${uuid}/stop`, {
-      method: 'GET',
+      method: 'POST',
     });
   }
 
   async restartService(uuid: string, pullLatest = false): Promise<MessageResponse> {
     const qs = pullLatest ? '?latest=true' : '';
     return this.request<MessageResponse>(`/services/${uuid}/restart${qs}`, {
-      method: 'GET',
+      method: 'POST',
     });
   }
 

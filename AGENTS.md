@@ -32,15 +32,15 @@ GitHub: `lutzkind/coolify-mcp` (public fork) · Canonical checkout:
 
 ## Commands
 
-| Purpose | Command |
-|---|---|
-| Install | `npm ci` |
-| Build | `npm run build` |
-| Targeted test | `npx jest src/__tests__/mcp-server.test.ts` |
-| Full suite | `npm test` (Jest, integration excluded) |
-| Lint / format | `npm run lint`, `npm run format:check` |
-| Integration | `npm run test:integration` (needs live Coolify + `.env`) |
-| Spec drift | `npm run check:spec-drift` |
+| Purpose       | Command                                                  |
+| ------------- | -------------------------------------------------------- |
+| Install       | `npm ci`                                                 |
+| Build         | `npm run build`                                          |
+| Targeted test | `npx jest src/__tests__/mcp-server.test.ts`              |
+| Full suite    | `npm test` (Jest, integration excluded)                  |
+| Lint / format | `npm run lint`, `npm run format:check`                   |
+| Integration   | `npm run test:integration` (needs live Coolify + `.env`) |
+| Spec drift    | `npm run check:spec-drift`                               |
 
 ## CI reality
 
