@@ -542,15 +542,18 @@ describe('CoolifyClient', () => {
       expect(result).toEqual(mockDeps);
     });
 
-    it('should deploy by tag', async () => {
+    it('should deploy by tag with the POST semantics current Coolify requires', async () => {
       mockFetch.mockResolvedValueOnce(mockResponse({ message: 'Deployed' }));
 
       const result = await client.deployByTagOrUuid('my-tag', true);
 
       expect(result).toEqual({ message: 'Deployed' });
       expect(mockFetch).toHaveBeenCalledWith(
-        'http://localhost:3000/api/v1/deploy?tag=my-tag&force=true',
-        expect.objectContaining({ method: 'POST' }),
+        'http://localhost:3000/api/v1/deploy',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ tag: 'my-tag', force: true }),
+        }),
       );
     });
 
@@ -561,8 +564,11 @@ describe('CoolifyClient', () => {
       await client.deployByTagOrUuid('xs0sgs4gog044s4k4c88kgsc', false);
 
       expect(mockFetch).toHaveBeenCalledWith(
-        'http://localhost:3000/api/v1/deploy?uuid=xs0sgs4gog044s4k4c88kgsc&force=false',
-        expect.objectContaining({ method: 'POST' }),
+        'http://localhost:3000/api/v1/deploy',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ uuid: 'xs0sgs4gog044s4k4c88kgsc', force: false }),
+        }),
       );
     });
 
@@ -573,8 +579,11 @@ describe('CoolifyClient', () => {
       await client.deployByTagOrUuid('a1b2c3d4-e5f6-7890-abcd-ef1234567890', true);
 
       expect(mockFetch).toHaveBeenCalledWith(
-        'http://localhost:3000/api/v1/deploy?uuid=a1b2c3d4-e5f6-7890-abcd-ef1234567890&force=true',
-        expect.objectContaining({ method: 'POST' }),
+        'http://localhost:3000/api/v1/deploy',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ uuid: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890', force: true }),
+        }),
       );
     });
 
@@ -588,9 +597,19 @@ describe('CoolifyClient', () => {
       );
       expect(methods).not.toContain('GET');
       expect(mockFetch).toHaveBeenCalledWith(
-        expect.stringContaining('/api/v1/deploy?uuid='),
+        'http://localhost:3000/api/v1/deploy',
         expect.objectContaining({ method: 'POST' }),
       );
+    });
+
+    it('should never call /deploy with GET', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse({ message: 'Deployed' }));
+
+      await client.deployByTagOrUuid('xs0sgs4gog044s4k4c88kgsc', false);
+
+      const [url, options] = mockFetch.mock.calls[0] as [string, RequestInit];
+      expect(url).not.toContain('?');
+      expect(options.method).toBe('POST');
     });
   });
 
@@ -3007,8 +3026,11 @@ describe('CoolifyClient', () => {
       await client.deployByTagOrUuid('my-tag');
 
       expect(mockFetch).toHaveBeenCalledWith(
-        'http://localhost:3000/api/v1/deploy?tag=my-tag&force=false',
-        expect.objectContaining({ method: 'POST' }),
+        'http://localhost:3000/api/v1/deploy',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ tag: 'my-tag', force: false }),
+        }),
       );
     });
   });
@@ -4150,8 +4172,11 @@ describe('CoolifyClient', () => {
 
         // Verify deploy calls use force=true
         expect(mockFetch).toHaveBeenCalledWith(
-          'http://localhost:3000/api/v1/deploy?tag=app-1&force=true',
-          expect.any(Object),
+          'http://localhost:3000/api/v1/deploy',
+          expect.objectContaining({
+            method: 'POST',
+            body: JSON.stringify({ tag: 'app-1', force: true }),
+          }),
         );
       });
 
@@ -4164,8 +4189,11 @@ describe('CoolifyClient', () => {
         await client.redeployProjectApps('proj-1', false);
 
         expect(mockFetch).toHaveBeenCalledWith(
-          'http://localhost:3000/api/v1/deploy?tag=app-1&force=false',
-          expect.any(Object),
+          'http://localhost:3000/api/v1/deploy',
+          expect.objectContaining({
+            method: 'POST',
+            body: JSON.stringify({ tag: 'app-1', force: false }),
+          }),
         );
       });
 

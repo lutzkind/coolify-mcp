@@ -1424,14 +1424,15 @@ export class CoolifyClient {
     tagOrUuid: string,
     force: boolean = false,
   ): Promise<DeployTriggerResponse> {
-    // Detect if the value looks like a UUID or a tag name
+    // Coolify moved this endpoint to POST; GET now returns
+    // 405 "This endpoint has changed to a POST request." The request body is
+    // the supported form on current releases, and the response keeps the
+    // `deployments` envelope used by deploymentUuidFromTrigger.
     const param = this.isLikelyUuid(tagOrUuid) ? 'uuid' : 'tag';
-    // Coolify >= 4.3 returns 400 "This endpoint has changed to a POST request."
-    // for GET /deploy; the deploy trigger is a POST-only mutation.
-    return this.request<DeployTriggerResponse>(
-      `/deploy?${param}=${encodeURIComponent(tagOrUuid)}&force=${force}`,
-      { method: 'POST' },
-    );
+    return this.request<DeployTriggerResponse>('/deploy', {
+      method: 'POST',
+      body: JSON.stringify({ [param]: tagOrUuid, force }),
+    });
   }
 
   /**
